@@ -691,8 +691,9 @@ class UpdateCase(CliCase):
         self.followed = True
         return 0
 
-    def update_context(self, action="install", yes=True, dry_run=False, reboot=False):
-        args = Namespace(dry_run=dry_run, yes=yes, prefix=self.prefix, action=action, reboot_if_stuck=reboot)
+    def update_context(self, action="install", yes=True, dry_run=False, reboot=False, source=None, tag=None):
+        args = Namespace(dry_run=dry_run, yes=yes, prefix=self.prefix, action=action, reboot_if_stuck=reboot,
+                         source=source, tag=tag)
         ctx = cli.Context(args)
         self.commands = []
         self.followed = False
@@ -999,6 +1000,81 @@ class UpdateLaunchTests(UpdateCase):
     def test_the_progress_is_followed_after_the_launch(self):
         self.install()
         self.assertTrue(self.followed)
+
+
+class UpdateSourceTests(UpdateCase):
+    """The rehearsal path: a release laid out by hand, no network, the same checks."""
+
+    def staged(self, name="rehearsal"):
+        stage = self.root / name
+        stage.mkdir()
+        for file in ("SHA256SUMS", "SHA256SUMS.asc", "uuway_1.2.1_amd64.deb"):
+            (stage / file).write_bytes(b"x" * 10)
+        return stage
+
+    def install_from(self, stage, tag="v1.2.1", **options):
+        ctx, args = self.update_context(source=stage, tag=tag, **options)
+        with patch.object(cli.sys.stdin, "isatty", return_value=True):
+            return ctx, args, self.quiet(cli.update_install, ctx, args)
+
+    def test_it_never_goes_online_and_stages_the_given_directory(self):
+        stage = self.staged()
+        ctx, args, (code, output) = self.install_from(stage)
+        self.assertEqual(code, 0)
+        self.assertEqual(self.fetcher.calls, [])
+        (command,) = self.launched()
+        script = command[command.index("/usr/bin/python3"):]
+        self.assertEqual(script[script.index("--stage") + 1], str(stage.resolve()))
+        self.assertEqual(script[script.index("--tag") + 1], "v1.2.1")
+        self.assertTrue((stage / "baseline.json").is_file())
+        self.assertIn("已读取并校验", output)
+
+    def test_it_is_checked_exactly_like_a_download(self):
+        def refuse(*args, **kwargs):
+            raise cli.update_checks.VerifyError("签名校验失败（BADSIG）。")
+        stage = self.staged()
+        ctx, args = self.update_context(source=stage, tag="v1.2.1")
+        with patch.object(cli.update_checks, "check_release", refuse), \
+                patch.object(cli.sys.stdin, "isatty", return_value=True), \
+                self.assertRaisesRegex(cli.SetupError, "BADSIG"):
+            self.quiet(cli.update_install, ctx, args)
+        self.assertEqual(self.launched(), [])
+
+    def test_the_tag_is_given_to_the_check_with_the_installed_version(self):
+        self.install_from(self.staged())
+        self.assertEqual(self.checked, ("v1.2.1", "1.2.0"))
+
+    def test_a_tag_is_required_and_must_be_plain(self):
+        for tag in (None, "", "v1.2", "1.2.1", "v1.2.1/../x"):
+            ctx, args = self.update_context(source=self.staged(f"s{abs(hash(tag))}"), tag=tag)
+            with self.assertRaisesRegex(cli.SetupError, "--tag"):
+                self.quiet(cli.update_install, ctx, args)
+
+    def test_a_version_that_is_not_newer_is_refused(self):
+        ctx, args = self.update_context(source=self.staged(), tag="v1.2.0")
+        with self.assertRaisesRegex(cli.SetupError, "不比已安装的"):
+            self.quiet(cli.update_install, ctx, args)
+
+    def test_the_directory_it_was_given_is_never_deleted(self):
+        ctx, args = self.update_context(source=self.root / "x", tag="v1.2.1")
+        inside = ctx.state_dir / "update" / "1.2.1"  # where downloads normally go
+        inside.mkdir(parents=True)
+        for file in ("SHA256SUMS", "SHA256SUMS.asc", "uuway_1.2.1_amd64.deb"):
+            (inside / file).write_bytes(b"x")
+        ctx, args, _ = self.install_from(inside)
+        self.assertTrue((inside / "uuway_1.2.1_amd64.deb").is_file())
+
+    def test_a_dry_run_with_a_source_does_not_go_online_either(self):
+        ctx, args, (code, output) = self.install_from(self.staged(), dry_run=True)
+        self.assertEqual(code, 0)
+        self.assertEqual(self.fetcher.calls, [])
+        self.assertEqual(self.launched(), [])
+
+    def test_the_option_is_not_advertised(self):
+        update = cli.build_parser()._subparsers._group_actions[0].choices["update"]
+        self.assertNotIn("--source", update.format_help())
+        self.assertNotIn("--tag", update.format_help())
+        self.assertIsNotNone(cli.build_parser().parse_args(["update", "install", "--source", "/x", "--tag", "v1.2.1"]).source)
 
 
 class UpdateFollowTests(UpdateCase):

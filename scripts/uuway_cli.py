@@ -1358,12 +1358,24 @@ def update_install(ctx, args):
     audit = ctx.probe(['dpkg', '--audit'])
     if audit.returncode != 0 or audit.stdout.strip():
         raise SetupError('dpkg 处于未完成状态，先修好它：sudo dpkg --configure -a')
-    latest = latest_known(ctx)
-    if not is_newer(ctx, latest.version, installed):
-        ok(f'已是最新（{installed}）。')
-        return 0
-    tag, version = latest.tag, latest.version
-    stage = ctx.state_dir / 'update' / version
+    source = getattr(args, 'source', None)
+    if source:
+        # A rehearsal: a release laid out by hand in a directory (docs/release-signing.md), with no
+        # network. It is checked exactly like a download, against the key the package ships.
+        match = update_checks.TAG.fullmatch(getattr(args, 'tag', None) or '')
+        if not match:
+            raise SetupError('--source 要和 --tag vX.Y.Z 一起用。')
+        tag, version = args.tag, match.group(1)
+        if not is_newer(ctx, version, installed):
+            raise SetupError(f'{version} 不比已安装的 {installed} 新。')
+        stage = Path(source).resolve()
+    else:
+        latest = latest_known(ctx)
+        if not is_newer(ctx, latest.version, installed):
+            ok(f'已是最新（{installed}）。')
+            return 0
+        tag, version = latest.tag, latest.version
+        stage = ctx.state_dir / 'update' / version
     baseline_file = stage / 'baseline.json'
     command = apply_command('apply', tag=tag, stage=stage, user=getpass.getuser(), uid=os.getuid(), home=ctx.home,
                             prefix=ctx.prefix, snapshot='<更新前快照>', baseline=baseline_file, reboot=args.reboot_if_stuck)
@@ -1376,16 +1388,17 @@ def update_install(ctx, args):
     problems = update_checks.baseline_problems(baseline)
     if problems:
         raise SetupError('机器现在就不太正常，不适合更新：' + '、'.join(problems) + '。先运行 uuway doctor。')
-    shutil.rmtree(ctx.state_dir / 'update', ignore_errors=True)
     try:
-        uuway_update.download_release(new_fetcher(), tag, stage)
+        if not source:
+            shutil.rmtree(ctx.state_dir / 'update', ignore_errors=True)
+            uuway_update.download_release(new_fetcher(), tag, stage)
         release = update_checks.check_release(stage, tag, installed, update_checks.KEYRING,
                                               update_checks.TRUSTED_FINGERPRINTS, run=subprocess.run)
     except uuway_update.Unsigned as error:
         raise SetupError(str(error))
     except (uuway_update.FetchError, update_checks.VerifyError) as error:
         raise SetupError(str(error))
-    ok(f'已下载并校验 {version}（签名和哈希都对得上）。')
+    ok(f'已{"读取" if source else "下载"}并校验 {version}（签名和哈希都对得上）。')
     check_disk_space(release.deb)
     write_atomic(baseline_file, json.dumps(baseline).encode(), 0o600)
     snapshot = ensure_backup(ctx)
@@ -1535,6 +1548,8 @@ def build_parser():
     update.add_argument('action', nargs='?', choices=('check', 'install', 'status', 'rollback'), default='check',
                         help='check 查看有没有新版本（默认）；install 安装；status 看上次更新的结果；rollback 回到更新前的版本')
     update.add_argument('--prefix', type=Path)
+    update.add_argument('--source', type=Path, help=argparse.SUPPRESS)  # rehearsal: a release staged by hand
+    update.add_argument('--tag', help=argparse.SUPPRESS)
     update.add_argument('--reboot-if-stuck', action='store_true',
                         help='回滚后桌面仍然回不来时，自动重启这台机器一次（会中断正在跑的任务）')
     update.set_defaults(handler=command_update)
