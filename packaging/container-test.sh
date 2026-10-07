@@ -158,7 +158,7 @@ check "uninstall removes only what uuway wrote and keeps the Wine prefix" bash -
 
 section "Update (real dpkg, apt and gpgv; the desktop session and the user's services are stood in for)"
 if [ -f /tmp/update-e2e.py ]; then
-    check "gpg is there to sign the test releases" apt-get install -y -qq --no-install-recommends gpg
+    check "gpg and its agent are there to sign the test releases" apt-get install -y -qq --no-install-recommends gpg gpg-agent
     # Run directly rather than through check(): its own lines say what passed and failed.
     if /usr/bin/python3 -I -B /tmp/update-e2e.py "$deb"; then
         printf '  ✓ %s\n' "an update installs, bad releases are refused, an unhealthy update is rolled back"

@@ -4,3 +4,7 @@ uuway: unstripped-binary-or-object [usr/lib/uuway/build/native-presenter/*]
 uuway: unstripped-binary-or-object [usr/lib/uuway/fcitx5/libuurb-native-ime.so]
 # prerm stops the *user* services of every logged-in user; deb-systemd-invoke only handles system units.
 uuway: maintainer-script-calls-systemctl [prerm:*]
+# The update rolls back by rebuilding the installed version as a deb from its own files, which
+# means reading this package's file list, checksums and maintainer scripts in /var/lib/dpkg/info.
+# It reads nothing of any other package and writes nothing there.
+uuway: uses-dpkg-database-directly [usr/lib/uuway/scripts/uuway_update_apply.py]

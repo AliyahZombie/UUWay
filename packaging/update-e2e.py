@@ -40,7 +40,11 @@ def check(name, condition, detail=''):
 
 
 def run(*argv, **kwargs):
-    return subprocess.run([str(a) for a in argv], capture_output=True, text=True, check=kwargs.pop('check', True), **kwargs)
+    check_exit = kwargs.pop('check', True)
+    result = subprocess.run([str(a) for a in argv], capture_output=True, text=True, check=False, **kwargs)
+    if check_exit and result.returncode != 0:
+        sys.exit(f'command failed ({result.returncode}): {" ".join(str(a) for a in argv)}\n{result.stderr.strip()[-800:]}')
+    return result
 
 
 class Clock:
@@ -102,9 +106,15 @@ def dpkg_clean():
 
 
 def package_listing(deb):
-    """Mode, owner, size and name of everything in a deb (no dates: a repack has its own)."""
+    """Mode, owner, size and name of everything in a deb (no dates: a repack has its own).
+
+    /usr/share/doc is left out: the Docker image of Ubuntu excludes it from every package it
+    installs, so those files were never on this machine to be repacked.
+    """
     lines = run('dpkg-deb', '-c', deb).stdout.splitlines()
-    return sorted((parts[0], parts[1], parts[2], parts[5], *parts[6:]) for parts in (line.split() for line in lines))
+    entries = (line.split() for line in lines)
+    return sorted((parts[0], parts[1], parts[2], parts[5], *parts[6:]) for parts in entries
+                  if not parts[5].startswith('./usr/share/doc/'))
 
 
 work = Path(tempfile.mkdtemp(prefix='update-e2e-'))
