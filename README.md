@@ -88,7 +88,9 @@ uuway setup --installer ~/Downloads/UURemote_Setup.exe
 - **只用远程、不常在机器前？** 运行 `uuway autologin on`：开机或断电恢复后 GDM 自动登录你的账号；桌面崩溃或手动注销后，登录界面停留约 10 秒也会自动重新登录，UU 随桌面自动上线（关闭：`uuway autologin off`；想在登录界面停留，先关闭它）。这是安全相关的开关，向导和 `--yes` 都不会替你开启；代价是任何能接触这台机器的人开机就能进入你的桌面，建议配合磁盘加密和自动锁屏。UU 在 GDM 登录界面是离线的，因为 UUWay 的采集和输入都只在你的桌面会话里；这个功能让登录界面只停留十几秒。
 - 向导会把 WineHQ 固定在 11.0 系列（写入 `/etc/apt/preferences.d/uuway-wine`，需要你确认），避免 `apt upgrade` 悄悄升到会让画面采集失效的版本。
 - 如果你使用 Fcitx5，向导会启用手机中文输入所需的插件，需要执行一次 `fcitx5 -r` 才会生效。
-- 升级：`sudo apt install ./新版本.deb`，再运行 `uuway refresh`（会重启桥接服务，正在进行的远程会话会短暂断开）。
+- 升级：`uuway update` 查看有没有新版本，`uuway update install` 下载、校验签名并安装。装好后它会自动运行 `uuway refresh`，等机器恢复在线并稳定约 90 秒；不正常就自动回滚到更新前的版本。更新期间远程连接会断开几分钟，但更新在后台独立运行，不怕你就在 UU 的远程终端里发起它，重连后用 `uuway update status` 看结果。机器没有开启「崩溃后自动重新登录」（`uuway autologin on`）时，`--yes` 单独不会让它继续。想回到更新前的版本：`uuway update rollback`。
+  `uuway update` 只在你运行它的时候访问 GitHub（`api.github.com` 和 `github.com`），UUWay 不会在后台检查更新，也不会自动安装。更新不会重启文字和显示服务；它们要用新代码时，在空闲时运行 `uuway refresh --restart-services`。
+  **1.2.0 是第一个带更新功能的版本，从 1.1.x 升到 1.2.0 要手动**：`sudo apt install ./uuway_1.2.0_amd64.deb`，再运行 `uuway refresh`（会重启桥接服务，正在进行的远程会话会短暂断开）。
 - 卸载：先 `uuway uninstall`，再 `sudo apt remove uuway`。Wine 前缀（含 UU 登录信息）不会被删除。
 
 > 已在 Ubuntu 24.04 + GNOME 46 Wayland + RTX 3090 + UU 4.42.0.2770 上长期日常使用。其他显卡、驱动和显示器配置还缺少验证，欢迎提交[兼容性报告](https://github.com/GaryOAO/UUWay/issues/new?template=compatibility-report.yml)，成功和失败的都有帮助。

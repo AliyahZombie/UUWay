@@ -146,6 +146,39 @@ Wine's ANSI code page follows the locale, and UU reads outgoing text in that cod
 service runs Wine with the session `LANG` rather than a desktop-wide `LC_ALL` override — otherwise
 CJK text would arrive on the phone as `?`.
 
+## Updates
+
+`uuway update` is built around one fact: a machine that is only used remotely is usually updated
+from UU's own remote terminal, and an update restarts the service that terminal belongs to.
+
+- **It outlives the terminal.** The shell the user types in sits in the bridge service's cgroup
+  (`KillMode=mixed`), so a child of that shell dies when the bridge restarts. The root side is a
+  transient *system* unit (`systemd-run`), which is in nobody's cgroup, held by a `shutdown:sleep`
+  inhibitor. A user-level unit would not survive a crash of the desktop session, and apt needs root
+  anyway. The unit is started with one authorization, in the terminal (sudo), because later nobody can
+  answer a polkit dialog: a shell opened through UU's terminal inherits `DISPLAY`, so `pkexec` would put
+  its dialog on a desktop nobody is watching.
+- **It trusts only a signed release.** The checks (`uuway_update_apply.py`, first half) run twice: as
+  the user before anything is asked, and as root on a copy that only root can change. A release counts
+  when `SHA256SUMS` has a valid detached signature from a pinned primary key (gpgv, empty home, one
+  keyring, verdict from the status lines), the deb matches the signed hash, says it is `uuway`/`amd64`
+  at the version in the tag, and that version is newer than the installed one. See
+  `docs/release-signing.md`.
+- **It can go back.** Before installing, the installed package is rebuilt as a deb from the files on
+  disk, so a rollback needs neither the old release nor the network. The user's configuration is
+  snapshotted too: the old installer refuses configuration it does not recognise, so a rollback restores
+  the files first and only then refreshes.
+- **It checks that the machine came back, against what it looked like before.** The three user services
+  stay up for 90 seconds without a restart, UU's processes run (recognised by the file name in `argv[0]`,
+  where wine shows the Windows path), and UU holds an established connection if it did before the update
+  and the network is up. `uuway doctor` is not used for this: it asks for a desktop environment that a root
+  process does not have, and would call a healthy machine broken. What cannot be seen from the machine is
+  whether a viewer gets a picture.
+- **It survives a reboot.** While an update runs, a one-shot unit under `/etc/systemd/system` (created
+  at run time, never shipped in the package) lets the machine pick it up again after a power cut or reboot:
+  repair dpkg, then carry on or roll back. It is removed when the update ends.
+- **It never reboots on its own** unless `--reboot-if-stuck` was given for that run, and then once.
+
 ## Not supported
 
 - **Super Screen** creates virtual monitors through UU's IddCx driver, a Windows kernel-mode

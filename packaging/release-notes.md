@@ -1,5 +1,14 @@
 ## UUWay：网易 UU 远程 Linux 被控端
 
+### 1.2.0 更新
+
+- **新增 `uuway update`：检查并安装新版本。** `uuway update` 只查看有没有新版本；`uuway update install` 下载、校验签名、备份、安装，装好后运行 `uuway refresh`，等机器回到线上并稳定约 90 秒，不正常就自动回滚到更新前的版本；`uuway update status` 看上次结果，`uuway update rollback` 手动回到更新前的版本。`uuway doctor` 会提示有新版本和上次更新是否失败，但它不联网。
+- **为纯远程使用的机器设计：更新不会让你失联。** 更新会重启桥接服务，而你很可能就是在 UU 的远程终端里发起它。所以更新以独立的系统服务在后台运行，终端断开不影响它；开始前只授权一次（在终端里问 sudo 密码）；更新后检查三个服务、UU 进程和 UU 的服务器连接是否恢复，不正常就回滚，回滚前先恢复你的配置快照；更新中途断电或重启，开机后会自动接着处理。没有开启「崩溃后自动重新登录」时，`--yes` 单独不会让它继续。回滚也失败时，会写出 `RECOVERY.txt` 说明怎么手动恢复；`--reboot-if-stuck` 才会在桌面始终回不来时重启一次机器。
+- **只安装有签名的版本。** 下载的 `SHA256SUMS` 必须带有发布密钥的签名，deb 必须与已签名的哈希一致、版本比已装的新、软件包名和架构对得上；下载只走 GitHub 的 https，不信任 GitHub 返回的链接。校验方法见 [docs/release-signing.md](https://github.com/GaryOAO/UUWay/blob/main/docs/release-signing.md)。
+- **只在你运行时联网。** `uuway update` 只在你运行它的时候访问 `api.github.com` 和 `github.com`，不会在后台检查，不会自动安装。
+- **从 1.1.x 升到 1.2.0 要手动**（`sudo apt install ./uuway_1.2.0_amd64.deb`，再 `uuway refresh`）：1.2.0 是第一个能自己更新的版本。
+- **修复：在 UU 远程终端里运行 `uuway setup --system`、`uuway autologin on` 时，授权窗口弹到没人的桌面上。** 现在在 UU 终端或 SSH 里改为在当前终端里问 sudo 密码；在本机桌面前仍然弹出授权窗口。
+
 ### 1.1.2 更新
 
 - **修复 PC 端远程终端打开约一秒后闪退。** 终端窗口初始化时，控制端可能先发一次不合理的窗口大小（[#2](https://github.com/GaryOAO/UUWay/issues/2) 里从 PC 端观察到 120×9001，随后才是 120×30）。以前桥接服务把这一帧当作协议错误，直接断开连接，整个终端随之结束。现在越界的窗口大小会被忽略，沿用上一次的大小；长度不对的畸形帧仍然会断开。
@@ -57,6 +66,8 @@ UUWay 采用 [GNU AGPL-3.0](https://github.com/GaryOAO/UUWay/blob/main/LICENSE)�
 UUWay 是独立的非官方项目，与网易无关，也未获得网易的认可。"UU"、"UU 远程"为其各自所有者的商标。安装包不含任何 UU 程序文件，客户端需由你自行从官方渠道安装。
 
 ---
+
+**English summary (1.2.0).** New: `uuway update` checks for a newer release, and `uuway update install` downloads it, verifies its signature, installs it, refreshes, waits for the machine to be back online and stable, and rolls back to the previous version if it is not; `status` and `rollback` complete it. It is built for machines that are only used remotely: the update runs as its own system service so that losing the terminal it was started from (often UU's own) does not stop it, asks for authorization once, and survives a power cut or reboot in the middle. Only signed releases are installed. It contacts GitHub only when you run it. 1.1.x to 1.2.0 is a manual install. Fixed: `uuway setup --system` and `uuway autologin on` no longer open a polkit dialog on an empty desktop when run from UU's terminal or SSH.
 
 **English summary (1.1.2).** The PC terminal no longer flash-quits: an out-of-range resize frame (reported: 120x9001 right before 120x30, issue #2) is ignored instead of dropping the connection, and a viewer that is still attached keeps its shell when UU removes its pane first. Both are covered by broker unit tests; they have not been verified end to end against a real PC client yet. Thanks to @dororo42 for the report.
 

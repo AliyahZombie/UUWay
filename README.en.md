@@ -109,8 +109,19 @@ device list. The wizard's messages are in Chinese.
   confirm), so that `apt upgrade` cannot move it to a version that breaks screen capture.
 - With Fcitx5, the wizard enables the add-on that phone text input needs; run `fcitx5 -r` once for it
   to load.
-- Upgrade with `sudo apt install ./newer.deb`, then `uuway refresh` (it restarts the bridge service,
-  so a running remote session drops briefly).
+- Upgrade with `uuway update` (is there a newer release?) and `uuway update install` (download, verify the
+  signature, install). It then runs `uuway refresh`, waits for the machine to be back online and stable for about
+  90 seconds, and rolls back to the version before the update if it is not. The remote connection drops for a few
+  minutes, but the update runs on its own in the background, so it is safe to start it from UU's own remote
+  terminal; reconnect and run `uuway update status` for the result. If the machine does not log itself back in
+  after a desktop crash (`uuway autologin on`), `--yes` alone will not let it go on. To go back to the version
+  before an update: `uuway update rollback`.
+  `uuway update` contacts GitHub (`api.github.com` and `github.com`) only when you run it; UUWay never checks in
+  the background and never installs anything by itself. An update does not restart the text and display
+  services; when they should run new code, run `uuway refresh --restart-services` while the machine is idle.
+  **1.2.0 is the first release that can update itself, so 1.1.x to 1.2.0 is manual:**
+  `sudo apt install ./uuway_1.2.0_amd64.deb`, then `uuway refresh` (it restarts the bridge service, so a running
+  remote session drops briefly).
 - Uninstall with `uuway uninstall`, then `sudo apt remove uuway`. The Wine prefix, which holds your UU
   login, is never deleted.
 
