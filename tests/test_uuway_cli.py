@@ -630,9 +630,16 @@ class FakeUpdateFetcher:
         self.unsigned = False
         self.not_modified = False
         self.failure = None
+        self.asc_failure = None
 
     def get(self, url, limit, headers=None):
         self.calls.append(("get", url, dict(headers or {})))
+        if url.endswith("SHA256SUMS.asc"):  # does the release carry its signature yet?
+            if self.unsigned:
+                raise cli.uuway_update.NotFound("x")
+            if self.asc_failure:
+                raise self.asc_failure
+            return b"sig", {}
         if self.failure:
             raise self.failure
         if self.not_modified and (headers or {}).get("If-None-Match"):
@@ -666,6 +673,7 @@ class UpdateCase(CliCase):
         self.fetcher = FakeUpdateFetcher()
         self.installed = "1.2.0"
         self.update_running = False
+        self.resume_running = False  # the boot-time unit is a oneshot: while it runs it is "activating"
         self.audit = ""
         self.recovery_layer = True
         self.progress = []
@@ -676,6 +684,11 @@ class UpdateCase(CliCase):
             deb = Path(stage) / f"uuway_{tag[1:]}_amd64.deb"
             return cli.update_checks.Release(tag[1:], deb, "0" * 64)
         self.checked = None
+        self.signed_checks = []
+
+        def check_signed_checksums(stage, tag, keyring, fingerprints, *, run):
+            self.signed_checks.append((Path(stage), tag))
+            return "0" * 64
         for override in (patch.object(cli, "DEB_ROOT", self.checkout.resolve()),
                          patch.object(cli, "UPDATE_STATE", self.state),
                          patch.object(cli, "CGROUP_FILE", self.cgroup),
@@ -683,6 +696,7 @@ class UpdateCase(CliCase):
                          patch.object(cli, "health_baseline", lambda ctx: self.baseline),
                          patch.object(cli, "timed_state", lambda ctx: (self.recovery_layer, cli.getpass.getuser())),
                          patch.object(cli, "follow_progress", self.follow),
+                         patch.object(cli.update_checks, "check_signed_checksums", check_signed_checksums),
                          patch.object(cli.update_checks, "check_release", check_release)):
             override.start()
             self.addCleanup(override.stop)
@@ -690,6 +704,10 @@ class UpdateCase(CliCase):
     def follow(self, ctx, started, already, limit=0):
         self.followed = True
         return 0
+
+    def api_calls(self):
+        """The requests to GitHub's API (as opposed to the one that looks for the signature file)."""
+        return [call for call in self.fetcher.calls if call[1] == cli.uuway_update.API_URL]
 
     def update_context(self, action="install", yes=True, dry_run=False, reboot=False, source=None, tag=None):
         args = Namespace(dry_run=dry_run, yes=yes, prefix=self.prefix, action=action, reboot_if_stuck=reboot,
@@ -708,8 +726,10 @@ class UpdateCase(CliCase):
                 return completed(argv, 0 if self.installed else 1, self.installed or "")
             if argv[:2] == ["dpkg", "--compare-versions"]:
                 return completed(argv, 0 if dotted(argv[2]) > dotted(argv[4]) else 1)
-            if argv[:3] == ["systemctl", "is-active", "--quiet"]:
-                return completed(argv, 0 if self.update_running else 3)
+            if argv[:2] == ["systemctl", "is-active"] and "--user" not in argv:
+                state = {"uuway-update": "active" if self.update_running else "inactive",
+                         "uuway-update-resume": "activating" if self.resume_running else "inactive"}[argv[-1]]
+                return completed(argv, 0 if state == "active" else 3, state + "\n")
             if argv[:2] == ["dpkg", "--audit"]:
                 return completed(argv, 0, self.audit)
             return completed(argv, 127)
@@ -738,6 +758,25 @@ class UpdateCheckTests(UpdateCase):
         self.assertIn("uuway update install", output)
         self.assertEqual(self.commands, [])  # a check never touches the system
 
+    def test_a_release_without_its_signature_is_said_not_to_be_installable_yet(self):
+        self.fetcher.unsigned = True
+        _, (code, output) = self.check()
+        self.assertEqual(code, 0)
+        self.assertIn("还没有签名", output)
+        self.assertNotIn("安装：uuway update install", output)
+
+    def test_a_signed_release_gets_the_install_hint(self):
+        _, (code, output) = self.check()
+        self.assertNotIn("还没有签名", output)
+        self.assertIn("uuway update install", output)
+
+    def test_when_the_signature_cannot_be_looked_for_nothing_is_claimed(self):
+        self.fetcher.asc_failure = cli.uuway_update.FetchError("无法连接 GitHub")
+        _, (code, output) = self.check()
+        self.assertEqual(code, 0)
+        self.assertNotIn("还没有签名", output)
+        self.assertIn("有新版本", output)
+
     def test_the_answer_is_cached_privately_for_doctor(self):
         ctx, _ = self.check()
         cache = ctx.state_dir / "update.json"
@@ -754,7 +793,7 @@ class UpdateCheckTests(UpdateCase):
         self.check()
         self.fetcher.not_modified = True
         _, (code, output) = self.check()
-        self.assertEqual(self.fetcher.calls[-1][2], {"If-None-Match": '"e1"'})
+        self.assertEqual(self.api_calls()[-1][2], {"If-None-Match": '"e1"'})
         self.assertIn("有新版本", output)
 
     def test_a_source_checkout_cannot_compare_versions_and_says_so(self):
@@ -774,7 +813,7 @@ class UpdateCheckTests(UpdateCase):
         ctx, _ = self.check()
         (ctx.state_dir / "update.json").write_text(json.dumps(dict(tag="v9.9.9", version="1.0.0", etag='"x"')))
         self.check()
-        self.assertEqual(self.fetcher.calls[-1][2], {})  # no etag was trusted from it
+        self.assertEqual(self.api_calls()[-1][2], {})  # no etag was trusted from it
 
 
 class UpdateRefusalTests(UpdateCase):
@@ -796,6 +835,10 @@ class UpdateRefusalTests(UpdateCase):
 
     def test_a_running_update_blocks_another(self):
         self.update_running = True
+        self.refused("已经有一个更新在进行")
+
+    def test_an_update_that_is_being_resumed_after_a_reboot_blocks_another(self):
+        self.resume_running = True
         self.refused("已经有一个更新在进行")
 
     def test_a_broken_dpkg_state_blocks_it(self):
@@ -826,6 +869,20 @@ class UpdateRefusalTests(UpdateCase):
         with patch.object(cli.update_checks, "check_release", refuse):
             self.refused("BADSIG")
 
+    def test_a_bad_signature_is_found_before_the_deb_is_downloaded(self):
+        def refuse(*args, **kwargs):
+            raise cli.update_checks.VerifyError("签名校验失败（BADSIG）。")
+        with patch.object(cli.update_checks, "check_signed_checksums", refuse):
+            self.refused("BADSIG")
+        saved = [call[1].rsplit("/", 1)[1] for call in self.fetcher.calls if call[0] == "save"]
+        self.assertEqual(sorted(saved), ["SHA256SUMS", "SHA256SUMS.asc"])  # the megabytes were never fetched
+
+    def test_the_early_check_gets_the_two_small_files_and_the_tag(self):
+        self.install()
+        ((stage, tag),) = self.signed_checks
+        self.assertEqual(tag, "v1.2.1")
+        self.assertEqual(stage.name, "1.2.1")
+
     def test_a_download_failure_is_reported(self):
         def broken(url, path, limit):
             raise cli.uuway_update.FetchError("下载超时，已放弃。")
@@ -834,6 +891,25 @@ class UpdateRefusalTests(UpdateCase):
 
     def test_too_little_disk_space_stops_it_before_anything_is_installed(self):
         usage = lambda path: Namespace(free=1 << 20)
+        with patch.object(cli.shutil, "disk_usage", usage):
+            self.refused("磁盘空间不够")
+
+    def test_a_directory_that_does_not_exist_yet_is_checked_on_the_disk_it_will_be_made_on(self):
+        asked = []
+
+        def usage(path):
+            asked.append(Path(path))
+            return Namespace(free=10 << 30)
+        deb = self.root / "x.deb"
+        deb.write_bytes(b"x" * 100)
+        with patch.object(cli.shutil, "disk_usage", usage):
+            cli.check_disk_space(deb, self.root / "not/made/yet")
+        self.assertIn(self.root, asked)
+        self.assertTrue(all(path.exists() for path in asked))
+
+    def test_the_disk_that_holds_the_downloads_is_checked_too(self):
+        def usage(path):
+            return Namespace(free=(10 << 30) if str(path) in ("/var/lib", "/usr") else 1 << 20)
         with patch.object(cli.shutil, "disk_usage", usage):
             self.refused("磁盘空间不够")
 
@@ -1098,6 +1174,68 @@ class UpdateFollowTests(UpdateCase):
         self.assertNotIn("older update", output)  # only what this update wrote
         self.assertIn("更新成功", output)
 
+    def test_an_update_that_died_without_a_result_is_noticed_not_waited_for(self):
+        ctx, _ = self.update_context()
+        started = time.time()
+        sleeps = []
+        with patch.object(cli.time, "sleep", sleeps.append):
+            code, output = self.quiet(ORIGINAL_FOLLOW, ctx, started, 0)
+        self.assertEqual(code, 1)
+        self.assertIn("没有留下结果", output)
+        self.assertIn("journalctl -u uuway-update", output)
+        self.assertLess(len(sleeps), 10)  # it did not sit there for 25 minutes
+
+    def test_a_running_update_is_waited_for(self):
+        ctx, _ = self.update_context()
+        self.update_running = True
+        started = time.time()
+        sleeps = []
+
+        def sleep(seconds):
+            sleeps.append(seconds)
+            if len(sleeps) == 6:  # long enough that an idle check would have given up
+                cli.write_atomic(self.state / "last-result.json", json.dumps(
+                    dict(outcome="success", message="好了", finished=started + 1, from_version="1.2.0",
+                         to_version="1.2.1")).encode(), 0o644)
+        with patch.object(cli.time, "sleep", sleep):
+            code, output = self.quiet(ORIGINAL_FOLLOW, ctx, started, 0)
+        self.assertEqual(code, 0)
+
+    def test_the_resume_unit_counts_as_running_too(self):
+        ctx, _ = self.update_context()
+        self.resume_running = True
+        started = time.time()
+        sleeps = []
+
+        def sleep(seconds):
+            sleeps.append(seconds)
+            if len(sleeps) == 6:
+                cli.write_atomic(self.state / "last-result.json", json.dumps(
+                    dict(outcome="success", message="好了", finished=started + 1, from_version="1.2.0",
+                         to_version="1.2.1")).encode(), 0o644)
+        with patch.object(cli.time, "sleep", sleep):
+            self.assertEqual(self.quiet(ORIGINAL_FOLLOW, ctx, started, 0)[0], 0)
+
+    def test_giving_up_waiting_is_not_success(self):
+        ctx, _ = self.update_context()
+        self.update_running = True  # alive, but it never produces a result
+        clock = iter(range(0, 10 ** 6, 400))
+        with patch.object(cli.time, "sleep", lambda seconds: None), patch.object(cli.time, "monotonic", lambda: next(clock)):
+            code, output = self.quiet(ORIGINAL_FOLLOW, ctx, time.time(), 0, limit=1000)
+        self.assertEqual(code, 1)
+        self.assertIn("uuway update status", output)
+
+    def test_a_deliberate_rollback_that_worked_is_a_success(self):
+        ctx, _ = self.update_context()
+        started = time.time()
+        cli.write_atomic(self.state / "last-result.json", json.dumps(
+            dict(outcome="rolled_back", manual=True, message="按要求手动回滚；已回滚，机器恢复正常。", finished=started + 1,
+                 from_version="1.2.0", to_version="1.2.1", rolled_back_to="1.2.0")).encode(), 0o644)
+        code, output = self.quiet(ORIGINAL_FOLLOW, ctx, started, 0)
+        self.assertEqual(code, 0)
+        self.assertIn("已回滚到 1.2.0", output)
+        self.assertNotIn("更新没有成功", output)
+
     def test_a_failed_update_makes_the_command_fail(self):
         ctx, _ = self.update_context()
         started = time.time()
@@ -1132,6 +1270,13 @@ class UpdateStatusTests(UpdateCase):
             self.assertEqual(status, code, outcome)
             self.assertIn(words, output, outcome)
 
+    def test_a_deliberate_rollback_is_not_described_as_a_failed_update(self):
+        self.result(outcome="rolled_back", manual=True, rolled_back_to="1.2.0")
+        code, output = self.status()
+        self.assertEqual(code, 0)
+        self.assertIn("已回滚到 1.2.0", output)
+        self.assertNotIn("更新没有成功", output)
+
     def test_a_failed_rollback_points_at_the_recovery_steps(self):
         self.result(outcome="rollback_failed", recovery=str(self.state / "RECOVERY.txt"))
         _, output = self.status()
@@ -1158,13 +1303,33 @@ class UpdateRollbackCommandTests(UpdateCase):
         with self.assertRaisesRegex(cli.SetupError, "没有可以回到的旧版本"):
             self.quiet(cli.update_rollback, ctx, args)
 
+    def test_a_refused_attempt_after_the_update_does_not_take_the_way_back_away(self):
+        previous = self.state / "previous/uuway_1.2.0_amd64.deb"
+        previous.parent.mkdir()
+        previous.write_bytes(b"x")
+        cli.write_atomic(self.state / "last-result.json", json.dumps(
+            dict(outcome="not_started", message="模拟安装失败", rollback_to=dict(deb=str(previous), version="1.2.0"),
+                 from_version="1.2.1", to_version="1.2.2", finished=time.time())).encode(), 0o644)
+        ctx, args = self.update_context("rollback")
+        with patch.object(cli.sys.stdin, "isatty", return_value=True):
+            code, output = self.quiet(cli.update_rollback, ctx, args)
+        self.assertEqual(len(self.launched()), 1)
+        self.assertIn("1.2.0", output)
+
+    def test_a_result_that_names_no_way_back_is_refused(self):
+        cli.write_atomic(self.state / "last-result.json", json.dumps(
+            dict(outcome="not_started", rollback_to=None, finished=time.time())).encode(), 0o644)
+        ctx, args = self.update_context("rollback")
+        with self.assertRaisesRegex(cli.SetupError, "没有可以回到的旧版本"):
+            self.quiet(cli.update_rollback, ctx, args)
+
     def test_rollback_launches_the_same_kind_of_detached_unit(self):
         previous = self.state / "previous/uuway_1.2.0_amd64.deb"
         previous.parent.mkdir()
         previous.write_bytes(b"x")
         cli.write_atomic(self.state / "last-result.json", json.dumps(
-            dict(outcome="success", previous_deb=str(previous), from_version="1.2.0", to_version="1.2.1",
-                 finished=time.time())).encode(), 0o644)
+            dict(outcome="success", rollback_to=dict(deb=str(previous), version="1.2.0"), from_version="1.2.0",
+                 to_version="1.2.1", finished=time.time())).encode(), 0o644)
         ctx, args = self.update_context("rollback")
         with patch.object(cli.sys.stdin, "isatty", return_value=True):
             code, output = self.quiet(cli.update_rollback, ctx, args)
@@ -1204,6 +1369,11 @@ class UpdateDoctorTests(UpdateCase):
             dict(outcome="rolled_back", message="不正常", finished=time.time() - 30 * 86400)).encode(), 0o644)
         self.assertNotIn("上次更新没有成功，已自动回滚", self.doctor())
 
+    def test_a_rollback_somebody_asked_for_is_not_a_warning(self):
+        cli.write_atomic(self.state / "last-result.json", json.dumps(
+            dict(outcome="rolled_back", manual=True, message="按要求手动回滚", finished=time.time())).encode(), 0o644)
+        self.assertFalse([name for name in self.doctor() if "上次更新" in name])
+
     def test_a_failed_rollback_points_at_the_recovery_file(self):
         cli.write_atomic(self.state / "last-result.json", json.dumps(
             dict(outcome="rollback_failed", finished=time.time(), recovery=str(self.state / "RECOVERY.txt"))).encode(), 0o644)
@@ -1214,6 +1384,29 @@ class UpdateDoctorTests(UpdateCase):
         cli.write_atomic(self.state / "last-result.json", json.dumps(
             dict(outcome="success", finished=time.time())).encode(), 0o644)
         self.assertFalse([name for name in self.doctor() if "上次更新" in name])
+
+
+class InterruptTests(unittest.TestCase):
+    def interrupted(self, *argv):
+        def raise_interrupt(args):
+            raise KeyboardInterrupt
+        with patch.object(cli, "build_parser") as parser:
+            parser.return_value.parse_args.return_value = Namespace(command=argv[0], handler=raise_interrupt)
+            stderr = io.StringIO()
+            with patch.object(cli.sys, "stderr", stderr):
+                code = cli.main(list(argv))
+        return code, stderr.getvalue()
+
+    def test_interrupting_an_update_says_it_carries_on(self):
+        code, message = self.interrupted("update")
+        self.assertEqual(code, 130)
+        self.assertIn("uuway update status", message)
+        self.assertNotIn("uuway setup", message)
+
+    def test_setup_keeps_its_own_message(self):
+        code, message = self.interrupted("setup")
+        self.assertEqual(code, 130)
+        self.assertIn("uuway setup", message)
 
 
 class UpdateParserTests(unittest.TestCase):

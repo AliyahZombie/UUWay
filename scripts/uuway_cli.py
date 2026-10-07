@@ -50,6 +50,7 @@ CGROUP_FILE = Path('/proc/self/cgroup')
 DEB_ROOT = Path('/usr/lib/uuway')  # where the package puts the tree; a checkout is somewhere else
 UPDATE_STATE = Path('/var/lib/uuway/update')  # root's record of updates; world-readable
 UPDATE_UNIT = 'uuway-update'
+UPDATE_RESUME_UNIT = 'uuway-update-resume'  # the one-shot that finishes an update a reboot interrupted
 UPDATE_STALE_DAYS = 14
 SERVICE_MARKER = '# Managed by UURB native installer;'
 DESKTOP_MARKER = '# Managed by UUWay console installer'
@@ -1197,6 +1198,14 @@ def latest_known(ctx):
     return latest
 
 
+def update_busy(ctx):
+    """True while an update is running, or being finished after a reboot."""
+    for unit in (UPDATE_UNIT, UPDATE_RESUME_UNIT):
+        if ctx.probe(['systemctl', 'is-active', unit]).stdout.strip() in ('active', 'activating', 'reloading'):
+            return True
+    return False
+
+
 def update_check(ctx, args):
     installed = deb_version(ctx)
     latest = latest_known(ctx)
@@ -1207,7 +1216,14 @@ def update_check(ctx, args):
     if is_newer(ctx, latest.version, installed):
         print(f'   {_paint("1;32", "有新版本")} {latest.version}（当前 {installed}，发布于 {latest.published[:10]}）')
         info(f'更新说明：{latest.url}')
-        info('安装：uuway update install（安装时远程连接会断开几分钟，会自动检查并在不正常时回滚）')
+        try:
+            signed = uuway_update.release_is_signed(new_fetcher(), latest.tag)
+        except uuway_update.FetchError:
+            signed = None  # cannot be told: claim nothing either way
+        if signed is False:
+            warn('这个版本已经发布，但还没有签名，暂时不能用 uuway update 安装；等维护者签名后再试。')
+        else:
+            info('安装：uuway update install（安装时远程连接会断开几分钟，会自动检查并在不正常时回滚）')
     else:
         ok(f'已是最新（{installed}）。')
     return 0
@@ -1228,6 +1244,8 @@ def describe_result(result):
     message = result.get('message', '')
     if outcome == 'success':
         ok(f'更新成功（{steps}，{when}）：{message}')
+    elif outcome == 'rolled_back' and result.get('manual'):
+        ok(f'已回滚到 {result.get("rolled_back_to")}（{when}）：{message}')
     elif outcome == 'rolled_back':
         warn(f'更新没有成功，已自动回滚（{steps}，{when}）：{message}')
         info('机器已恢复；失败的原因见 journalctl -u uuway-update。重试前先看看发布说明。')
@@ -1241,8 +1259,13 @@ def describe_result(result):
     return outcome
 
 
+def result_succeeded(result):
+    """A finished update that worked, or a rollback that was asked for and worked."""
+    return result.get('outcome') == 'success' or (result.get('outcome') == 'rolled_back' and bool(result.get('manual')))
+
+
 def update_status(ctx, args):
-    if ctx.probe(['systemctl', 'is-active', '--quiet', UPDATE_UNIT]).returncode == 0:
+    if update_busy(ctx):
         warn('更新正在进行中，最近的进度：')
         for line in read_progress(12):
             info(line)
@@ -1276,9 +1299,11 @@ def health_baseline(ctx):
     return update_checks.snapshot_health(job)
 
 
-def check_disk_space(deb):
+def check_disk_space(deb, *also):
     need = 4 * deb.stat().st_size + (100 << 20)  # the new package, the saved old one, their unpacking, and margin
-    for directory in (Path('/var/lib'), Path('/usr')):
+    for directory in (Path('/var/lib'), Path('/usr'), *also):
+        while not directory.exists() and directory != directory.parent:
+            directory = directory.parent  # not made yet: what matters is the disk it will be made on
         free = shutil.disk_usage(directory).free
         if free < need:
             raise SetupError(f'{directory} 所在的磁盘空间不够：需要约 {need >> 20} MiB，只剩 {free >> 20} MiB。')
@@ -1309,6 +1334,7 @@ def follow_progress(ctx, started, already, limit=1500):
     info('更新在后台进行，这个终端断开也不会影响它；重连后运行 uuway update status 查看结果。')
     shown = already
     deadline = time.monotonic() + limit
+    idle = 0
     while time.monotonic() < deadline:
         lines = read_progress(10 ** 6)
         for line in lines[shown:]:
@@ -1316,10 +1342,19 @@ def follow_progress(ctx, started, already, limit=1500):
         shown = len(lines)
         result = read_json(UPDATE_STATE / 'last-result.json')
         if isinstance(result, dict) and result.get('finished', 0) >= started:
-            return 0 if describe_result(result) == 'success' else 1
+            describe_result(result)
+            return 0 if result_succeeded(result) else 1
+        # Not running and no result: it died before it could say how it ended.  A few looks, not one,
+        # because the unit takes a moment to show up after systemd-run returns.
+        idle = 0 if update_busy(ctx) else idle + 1
+        if idle >= 3:
+            warn('更新进程已经退出，但没有留下结果。看看发生了什么：journalctl -u uuway-update')
+            info('机器可能处在中间状态；运行 uuway update status 和 uuway doctor 看看，必要时按 '
+                 f'{UPDATE_STATE / "RECOVERY.txt"} 里的步骤恢复。')
+            return 1
         time.sleep(2)
     warn('等了很久还没有结束；运行 uuway update status 查看。')
-    return 0
+    return 1
 
 
 def launch_update(ctx, command):
@@ -1353,7 +1388,7 @@ def update_install(ctx, args):
         raise SetupError('uuway update install 只支持用安装包（.deb）装的 UUWay；源码目录请自己更新。')
     if installed.startswith('0.0.0~'):
         raise SetupError(f'这是开发构建（{installed}），不能用 OTA 更新。')
-    if ctx.probe(['systemctl', 'is-active', '--quiet', UPDATE_UNIT]).returncode == 0:
+    if update_busy(ctx):
         raise SetupError('已经有一个更新在进行；运行 uuway update status 查看。')
     audit = ctx.probe(['dpkg', '--audit'])
     if audit.returncode != 0 or audit.stdout.strip():
@@ -1391,7 +1426,10 @@ def update_install(ctx, args):
     try:
         if not source:
             shutil.rmtree(ctx.state_dir / 'update', ignore_errors=True)
-            uuway_update.download_release(new_fetcher(), tag, stage)
+            uuway_update.download_release(
+                new_fetcher(), tag, stage,
+                before_deb=lambda staged: update_checks.check_signed_checksums(
+                    staged, tag, update_checks.KEYRING, update_checks.TRUSTED_FINGERPRINTS, run=subprocess.run))
         release = update_checks.check_release(stage, tag, installed, update_checks.KEYRING,
                                               update_checks.TRUSTED_FINGERPRINTS, run=subprocess.run)
     except uuway_update.Unsigned as error:
@@ -1399,7 +1437,7 @@ def update_install(ctx, args):
     except (uuway_update.FetchError, update_checks.VerifyError) as error:
         raise SetupError(str(error))
     ok(f'已{"读取" if source else "下载"}并校验 {version}（签名和哈希都对得上）。')
-    check_disk_space(release.deb)
+    check_disk_space(release.deb, ctx.state_dir)  # where the download and the snapshot live
     write_atomic(baseline_file, json.dumps(baseline).encode(), 0o600)
     snapshot = ensure_backup(ctx)
     command = apply_command('apply', tag=tag, stage=stage, user=getpass.getuser(), uid=os.getuid(), home=ctx.home,
@@ -1416,12 +1454,13 @@ def update_install(ctx, args):
 
 def update_rollback(ctx, args):
     result = read_json(UPDATE_STATE / 'last-result.json')
-    previous = Path(result.get('previous_deb') or '/nonexistent') if isinstance(result, dict) else None
+    target = result.get('rollback_to') if isinstance(result, dict) else None
+    previous = Path(str(target.get('deb') or '/nonexistent')) if isinstance(target, dict) else None
     if previous is None or not previous.is_file():
         raise SetupError('没有可以回到的旧版本（还没有用 uuway update 更新过，或者备份已被清掉）。')
-    if ctx.probe(['systemctl', 'is-active', '--quiet', UPDATE_UNIT]).returncode == 0:
+    if update_busy(ctx):
         raise SetupError('已经有一个更新在进行；运行 uuway update status 查看。')
-    print(f'\n将回到更新前的版本 {result.get("from_version")}（现在是 {deb_version(ctx) or "未知"}）。')
+    print(f'\n将回到更新前的版本 {target.get("version")}（现在是 {deb_version(ctx) or "未知"}）。')
     if ctx.dry_run:
         info('（演练）会以 root 运行：')
         print('   ' + _paint('2', '$ ' + ' '.join(ctx.elevate(apply_command('rollback', reboot=args.reboot_if_stuck),
@@ -1453,7 +1492,8 @@ def update_notices(ctx):
                 checked = time.strftime('%Y-%m-%d', time.localtime(cache.get('checked_at', 0)))
                 notices.append(('warn', f'有新版本 {cache["version"]}', f'运行 uuway update 查看（上次检查：{checked}）'))
     result = read_json(UPDATE_STATE / 'last-result.json')
-    if isinstance(result, dict) and result.get('outcome') in ('rolled_back', 'rollback_failed'):
+    if isinstance(result, dict) and result.get('outcome') in ('rolled_back', 'rollback_failed') \
+            and not result_succeeded(result):
         if time.time() - result.get('finished', 0) < UPDATE_STALE_DAYS * 86400:
             if result['outcome'] == 'rolled_back':
                 notices.append(('warn', '上次更新没有成功，已自动回滚', f'{result.get("message", "")}；详情：uuway update status'))
@@ -1570,7 +1610,11 @@ def main(argv=None):
         print(f'\n{_paint("31", "✗")} {error}', file=sys.stderr)
         return 1
     except KeyboardInterrupt:
-        print('\n已中断；重新运行 uuway setup 会从未完成的步骤继续。', file=sys.stderr)
+        if getattr(args, 'command', None) == 'update':
+            # Only the watching stops: an update that has started carries on in its own unit.
+            print('\n已中断。如果更新已经开始，它会在后台继续；运行 uuway update status 查看结果。', file=sys.stderr)
+        else:
+            print('\n已中断；重新运行 uuway setup 会从未完成的步骤继续。', file=sys.stderr)
         return 130
 
 
