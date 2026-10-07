@@ -156,10 +156,22 @@ check "uninstall removes only what uuway wrote and keeps the Wine prefix" bash -
     runuser -u tester -- env HOME=/home/tester uuway uninstall --yes --purge > /tmp/uninstall.txt 2>&1
     [ ! -e $units/uu-native-bridge.service ] && [ -d /home/tester/.local/share/wineprefixes/uu-remote ]"
 
+section "Update (real dpkg, apt and gpgv; the desktop session and the user's services are stood in for)"
+if [ -f /tmp/update-e2e.py ]; then
+    check "gpg is there to sign the test releases" apt-get install -y -qq --no-install-recommends gpg
+    # Run directly rather than through check(): its own lines say what passed and failed.
+    if /usr/bin/python3 -I -B /tmp/update-e2e.py "$deb"; then
+        printf '  ✓ %s\n' "an update installs, bad releases are refused, an unhealthy update is rolled back"
+    else
+        failures+=("update end to end")
+    fi
+fi
+
 section "Lifecycle"
 check "reinstalling the same package works" dpkg -i "$deb"
 check "removal succeeds and takes the tree with it" bash -c "apt-get remove -y -qq uuway && [ ! -e $lib ] && [ ! -e /usr/bin/uuway ]"
 check "purge succeeds and leaves home directories alone" bash -c "apt-get purge -y -qq uuway && [ -d /home/tester/.local/share/wineprefixes/uu-remote ]"
+check "purge also clears what updates left in root's state" bash -c "[ ! -e /var/lib/uuway ] && [ ! -e /etc/systemd/system/uuway-update-resume.service ]"
 
 if [ "${UUWAY_LINT:-1}" = 1 ]; then
     section "lintian"

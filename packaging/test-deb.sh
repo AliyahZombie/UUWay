@@ -27,4 +27,5 @@ trap cleanup EXIT
 docker run -d --name "$name" ubuntu:24.04 sleep infinity >/dev/null
 docker cp "$deb" "$name:/tmp/uuway.deb"
 docker cp "$repo_dir/packaging/container-test.sh" "$name:/tmp/container-test.sh"
+docker cp "$repo_dir/packaging/update-e2e.py" "$name:/tmp/update-e2e.py"
 docker exec -e "UUWAY_LINT=$lint" "$name" bash /tmp/container-test.sh /tmp/uuway.deb

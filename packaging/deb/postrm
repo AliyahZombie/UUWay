@@ -13,6 +13,15 @@ remove|purge)
     ;;
 esac
 
+case "$1" in
+purge)
+    # What an update left in root's own state: the saved previous version, results, logs.
+    rm -rf /var/lib/uuway
+    rm -f /etc/systemd/system/uuway-update-resume.service \
+        /etc/systemd/system/multi-user.target.wants/uuway-update-resume.service
+    ;;
+esac
+
 # purge deliberately leaves every home directory alone: the Wine prefix, the UU
 # login, the screen-share grant and ~/.config/uurb belong to the user.
 exit 0
