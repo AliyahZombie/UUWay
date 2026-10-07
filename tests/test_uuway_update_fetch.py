@@ -1,13 +1,16 @@
 """uuway update, user side: what is asked of GitHub, and how little of its answer is believed."""
 import email.message
+import http.client
 import importlib.util
 import io
 import json
 import os
 from pathlib import Path
+import ssl
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 import urllib.error
 import urllib.request
 
@@ -134,6 +137,52 @@ class FetcherTests(unittest.TestCase):
             self.assertEqual(target.stat().st_mode & 0o777, 0o600)
             self.assertEqual(sorted(path.name for path in Path(directory).iterdir()), ["x.deb"])
 
+    def test_a_connection_that_breaks_while_reading_is_an_ordinary_failure(self):
+        class Breaking(FakeResponse):
+            def __init__(self, failure):
+                super().__init__(b"x" * 10)
+                self.failure = failure
+
+            def read(self, amount=-1):
+                raise self.failure
+        for failure in (TimeoutError("timed out"), ConnectionResetError("reset"), http.client.IncompleteRead(b"x", 5),
+                        ssl.SSLError("bad record mac")):
+            with self.assertRaisesRegex(update.FetchError, "下载中断", msg=repr(failure)):
+                self.fetcher({self.URL: Breaking(failure)}).get(self.URL, 1024)
+            with tempfile.TemporaryDirectory() as directory:
+                target = Path(directory) / "x.deb"
+                with self.assertRaisesRegex(update.FetchError, "下载中断", msg=repr(failure)):
+                    self.fetcher({self.URL: Breaking(failure)}).save(self.URL, target, 1024)
+                self.assertEqual(list(Path(directory).iterdir()), [])  # no partial file left
+
+    def test_a_body_shorter_than_announced_is_not_a_download(self):
+        short = FakeResponse(b"x" * 5000, {"Content-Length": "100000"})
+        with self.assertRaisesRegex(update.FetchError, "下载中断"):
+            self.fetcher({self.URL: short}).get(self.URL, 1 << 20)
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "x.deb"
+            with self.assertRaisesRegex(update.FetchError, "下载中断"):
+                self.fetcher({self.URL: FakeResponse(b"x" * 5000, {"Content-Length": "100000"})}).save(
+                    self.URL, target, 1 << 20)
+            self.assertEqual(list(Path(directory).iterdir()), [])  # the truncated file was not kept
+
+    def test_a_body_exactly_as_long_as_announced_is_fine(self):
+        body, _ = self.fetcher({self.URL: FakeResponse(b"x" * 5000, {"Content-Length": "5000"})}).get(self.URL, 1 << 20)
+        self.assertEqual(len(body), 5000)
+
+    def test_a_disk_that_cannot_take_the_file_is_an_ordinary_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "x.deb"
+
+            def full(*args, **kwargs):
+                raise OSError(28, "No space left on device")
+            with patch.object(update.os, "fsync", full), self.assertRaisesRegex(update.FetchError, "No space left"):
+                self.fetcher({self.URL: FakeResponse(b"deb-bytes")}).save(self.URL, target, 1024)
+            self.assertEqual(list(Path(directory).iterdir()), [])
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(update.FetchError, "无法保存"):
+                self.fetcher({self.URL: FakeResponse(b"x")}).save(self.URL, Path(directory) / "missing/dir/x.deb", 1024)
+
     def test_a_failed_download_leaves_neither_a_file_nor_a_partial(self):
         with tempfile.TemporaryDirectory() as directory:
             target = Path(directory) / "x.deb"
@@ -209,6 +258,26 @@ class LatestReleaseTests(unittest.TestCase):
                 self.latest(body)
 
 
+class ReleaseIsSignedTests(unittest.TestCase):
+    URL = "https://github.com/GaryOAO/UUWay/releases/download/v1.2.1/SHA256SUMS.asc"
+
+    def test_a_signature_asset_means_signed(self):
+        self.assertTrue(update.release_is_signed(FakeFetcher({self.URL: b"sig"}), "v1.2.1"))
+
+    def test_no_signature_asset_means_not_signed_yet(self):
+        self.assertFalse(update.release_is_signed(FakeFetcher({self.URL: update.NotFound("x")}), "v1.2.1"))
+
+    def test_when_it_cannot_be_told_it_says_so_instead_of_guessing(self):
+        with self.assertRaises(update.FetchError):
+            update.release_is_signed(FakeFetcher({self.URL: update.FetchError("无法连接 GitHub")}), "v1.2.1")
+
+    def test_a_bad_tag_is_refused_before_any_request(self):
+        fetcher = FakeFetcher({})
+        with self.assertRaises(update.FetchError):
+            update.release_is_signed(fetcher, "latest")
+        self.assertEqual(fetcher.calls, [])
+
+
 class DownloadReleaseTests(unittest.TestCase):
     BASE = "https://github.com/GaryOAO/UUWay/releases/download/v1.2.1/"
 
@@ -232,6 +301,19 @@ class DownloadReleaseTests(unittest.TestCase):
             limits = {call[1].rsplit("/", 1)[1]: call[2] for call in fetcher.calls}
             self.assertEqual(limits["uuway_1.2.1_amd64.deb"], update.DEB_LIMIT)
             self.assertEqual(limits["SHA256SUMS"], update.SMALL_LIMIT)
+
+    def test_the_small_files_can_be_checked_before_the_deb_is_downloaded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fetcher = FakeFetcher(self.answers())
+            seen = []
+
+            def refuse(stage):
+                seen.append(sorted(path.name for path in Path(stage).iterdir()))
+                raise update.checks.VerifyError("签名校验失败（BADSIG）。")
+            with self.assertRaisesRegex(update.checks.VerifyError, "BADSIG"):
+                update.download_release(fetcher, "v1.2.1", Path(directory) / "s", before_deb=refuse)
+            self.assertEqual(seen, [["SHA256SUMS", "SHA256SUMS.asc"]])  # exactly the two small files were there
+            self.assertFalse(any(call[1].endswith(".deb") for call in fetcher.calls))
 
     def test_a_release_without_a_signature_is_reported_before_the_deb_is_downloaded(self):
         with tempfile.TemporaryDirectory() as directory:

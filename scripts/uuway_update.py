@@ -130,13 +130,22 @@ class Fetcher:
 
     def _read(self, response, limit, sink):
         announced = response.headers.get('Content-Length')
-        if announced and announced.isdigit() and int(announced) > limit:
+        announced = int(announced) if announced and announced.isdigit() else None
+        if announced is not None and announced > limit:
             raise FetchError(f'GitHub 返回的内容过大（{announced} 字节），已拒绝。')
         total = 0
         while True:
             self._check_deadline()
-            block = response.read(65536)
+            try:
+                block = response.read(65536)
+            except (OSError, http.client.HTTPException, ssl.SSLError) as error:
+                # A connection can break halfway through a long download, after _open has succeeded.
+                raise FetchError(f'下载中断：{getattr(error, "reason", None) or error}') from None
             if not block:
+                if announced is not None and total != announced:
+                    # http.client ends a body that stops early without complaining; a short deb
+                    # would otherwise be taken for a whole one and later look like tampering.
+                    raise FetchError(f'下载中断：只收到 {total} / {announced} 字节。')
                 return
             total += len(block)
             if total > limit:
@@ -155,14 +164,23 @@ class Fetcher:
         path = Path(path)
         part = path.with_name(path.name + '.part')
         with self._open(url, None) as response:
-            part.unlink(missing_ok=True)  # a symlink left there is removed, never followed
-            descriptor = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+            try:
+                part.unlink(missing_ok=True)  # a symlink left there is removed, never followed
+                descriptor = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+            except OSError as error:
+                raise FetchError(f'无法保存下载（{error.strerror}）：{part}') from None
             try:
                 with os.fdopen(descriptor, 'wb') as handle:
                     self._read(response, limit, handle.write)
                     handle.flush()
                     os.fsync(handle.fileno())
                 os.replace(part, path)
+            except FetchError:
+                part.unlink(missing_ok=True)
+                raise
+            except OSError as error:  # a full disk, mostly
+                part.unlink(missing_ok=True)
+                raise FetchError(f'无法保存下载（{error.strerror}）：{path}') from None
             except BaseException:
                 part.unlink(missing_ok=True)
                 raise
@@ -189,8 +207,24 @@ def latest_release(fetcher, etag=None):
                   headers.get('etag'), RELEASE_PAGE.format(tag=tag))
 
 
-def download_release(fetcher, tag, dest):
-    """Fetch the deb, SHA256SUMS and SHA256SUMS.asc of `tag` into `dest` (created 0700)."""
+def release_is_signed(fetcher, tag):
+    """Whether the release already carries its signature; FetchError when that cannot be told."""
+    match = checks.TAG.fullmatch(tag)
+    if not match:
+        raise FetchError(f'发布标签（tag）必须形如 vX.Y.Z，收到的是 {tag!r}。')
+    try:
+        fetcher.get(DOWNLOAD_URL.format(tag=tag, name='SHA256SUMS.asc'), SMALL_LIMIT)
+    except NotFound:
+        return False
+    return True
+
+
+def download_release(fetcher, tag, dest, before_deb=None):
+    """Fetch the deb, SHA256SUMS and SHA256SUMS.asc of `tag` into `dest` (created 0700).
+
+    `before_deb(dest)` runs once the two small files are there and before the deb is fetched, so a
+    release that cannot be trusted costs a kilobyte instead of the whole download.
+    """
     match = checks.TAG.fullmatch(tag)
     if not match:
         raise FetchError(f'发布标签（tag）必须形如 vX.Y.Z，收到的是 {tag!r}。')
@@ -200,6 +234,8 @@ def download_release(fetcher, tag, dest):
     # The signature first: an unsigned release is reported before a megabyte is downloaded.
     for name, limit in (('SHA256SUMS.asc', SMALL_LIMIT), ('SHA256SUMS', SMALL_LIMIT),
                         (checks.deb_name(match.group(1)), DEB_LIMIT)):
+        if name == checks.deb_name(match.group(1)) and before_deb is not None:
+            before_deb(dest)
         try:
             fetcher.save(DOWNLOAD_URL.format(tag=tag, name=name), dest / name, limit)
         except NotFound:
