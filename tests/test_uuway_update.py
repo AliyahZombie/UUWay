@@ -64,7 +64,7 @@ class Workspace(unittest.TestCase):
         subprocess.run(["dpkg-deb", "--root-owner-group", "-b", str(tree), str(path)], check=True, capture_output=True)
         return path
 
-    def release(self, home, version="1.2.1", **deb_fields):
+    def release(self, home, version="1.2.1", sign=True, **deb_fields):
         """A staged release as the updater downloads it: deb, SHA256SUMS, SHA256SUMS.asc."""
         stage = self.root / f"stage-{version}"
         stage.mkdir(exist_ok=True)
@@ -72,7 +72,8 @@ class Workspace(unittest.TestCase):
                             **deb_fields)
         sums = stage / "SHA256SUMS"
         sums.write_text(f"{hashlib.sha256(deb.read_bytes()).hexdigest()}  {deb.name}\n")
-        self.sign(home, sums)
+        if sign:
+            self.sign(home, sums)
         return stage
 
 
@@ -141,6 +142,29 @@ class CheckReleaseTests(Workspace):
                 os.environ.pop("GNUPGHOME")
             else:
                 os.environ["GNUPGHOME"] = previous
+
+    def test_a_release_signed_twice_is_accepted_by_an_install_that_knows_only_one_key(self):
+        # Replacing the key: release N is signed with the old and the new key, and the install that
+        # verifies it is the old one, whose keyring and pinned fingerprints hold only the old key.
+        new_home, new_fingerprint, new_keyring = self.make_key("replacement")
+        exported = self.gpg(new_home, "--export-secret-keys").stdout
+        self.gpg(self.home, "--import", input=exported)
+        stage = self.release(self.home, sign=False)
+        sums = stage / "SHA256SUMS"
+        self.gpg(self.home, "--yes", "--armor", "--detach-sign", "--local-user", self.fingerprint,
+                 "--local-user", new_fingerprint, "-o", str(sums) + ".asc", str(sums))
+        result = self.check(stage)  # self.keyring and self.fingerprint: the old key only
+        self.assertEqual(result.version, "1.2.1")
+        both = self.root / "both.gpg"
+        both.write_bytes(self.keyring.read_bytes() + new_keyring.read_bytes())
+        self.assertEqual(self.check(stage, keyring=both, fingerprints=(self.fingerprint, new_fingerprint)).version, "1.2.1")
+        with self.assertRaisesRegex(apply.VerifyError, "指纹"):  # an install that trusts only the new key: the old
+            self.check(stage, keyring=both, fingerprints=(new_fingerprint,))  # signature is valid but not pinned
+
+    def test_a_release_signed_only_by_a_key_the_install_does_not_know_is_refused(self):
+        new_home, new_fingerprint, _ = self.make_key("replacement")
+        with self.assertRaises(apply.VerifyError):
+            self.check(self.release(new_home))
 
     def test_without_a_pinned_fingerprint_nothing_is_trusted(self):
         with self.assertRaisesRegex(apply.VerifyError, "指纹"):
@@ -242,9 +266,35 @@ class SignatureStatusTests(unittest.TestCase):
                 self.verify(self.valid(algorithm=algorithm))
 
     def test_every_bad_status_is_refused_even_next_to_a_valid_signature(self):
-        for status in ("BADSIG", "ERRSIG", "EXPKEYSIG", "REVKEYSIG", "EXPSIG", "NO_PUBKEY"):
+        for status in ("BADSIG", "EXPKEYSIG", "REVKEYSIG", "EXPSIG"):
             with self.assertRaises(apply.VerifyError, msg=status):
                 self.verify(self.valid() + f"[GNUPG:] {status} {self.FPR} x\n")
+
+    def test_an_error_that_is_not_a_missing_key_is_refused(self):
+        for reason in ("4", "1", "0", "99"):  # 4 is an algorithm gpgv does not know
+            with self.assertRaises(apply.VerifyError, msg=reason):
+                self.verify(self.valid() + f"[GNUPG:] ERRSIG {'C' * 16} 22 10 00 1791357456 {reason} {'D' * 40}\n", code=2)
+        with self.assertRaises(apply.VerifyError):
+            self.verify(self.valid() + "[GNUPG:] ERRSIG C 22\n", code=2)  # too short to say why
+
+    MISSING = "[GNUPG:] ERRSIG CCCCCCCCCCCCCCCC 22 10 00 1791357456 9 " + "D" * 40 + "\n[GNUPG:] NO_PUBKEY CCCCCCCCCCCCCCCC\n"
+
+    def test_a_signature_by_a_key_this_install_does_not_know_is_ignored(self):
+        # The old install checks the old key's signature on a release that was signed twice.
+        self.verify(self.valid() + self.MISSING, code=2)
+        self.verify(self.MISSING + self.valid(), code=2)
+
+    def test_a_missing_key_is_no_substitute_for_a_valid_signature(self):
+        with self.assertRaises(apply.VerifyError):
+            self.verify(self.MISSING, code=2)
+        with self.assertRaises(apply.VerifyError):
+            self.verify("[GNUPG:] NO_PUBKEY CCCCCCCCCCCCCCCC\n", code=2)
+
+    def test_exit_code_two_is_only_understood_next_to_a_missing_key(self):
+        with self.assertRaises(apply.VerifyError):
+            self.verify(self.valid(), code=2)  # nothing explains the failure
+        with self.assertRaises(apply.VerifyError):
+            self.verify(self.valid() + self.MISSING, code=1)
 
     def test_a_failing_exit_code_or_no_valid_signature_is_refused(self):
         with self.assertRaises(apply.VerifyError):

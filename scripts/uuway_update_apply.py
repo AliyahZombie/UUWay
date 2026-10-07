@@ -39,7 +39,8 @@ PACKAGE = 'uuway'
 ARCHITECTURE = 'amd64'
 TAG = re.compile(r'v((?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*))')
 SUMS_LINE = re.compile(r'([0-9a-f]{64})  ([A-Za-z0-9][A-Za-z0-9._+~-]*)')
-BAD_STATUS = ('BADSIG', 'ERRSIG', 'EXPKEYSIG', 'REVKEYSIG', 'EXPSIG', 'NO_PUBKEY')
+BAD_STATUS = ('BADSIG', 'EXPKEYSIG', 'REVKEYSIG', 'EXPSIG')
+MISSING_KEY = '9'  # the reason code in `ERRSIG`: the signing key is not in the keyring
 STRONG_HASHES = ('8', '9', '10')  # OpenPGP ids of SHA-256, SHA-384 and SHA-512
 
 Release = collections.namedtuple('Release', 'version deb sha256')
@@ -97,16 +98,24 @@ def verify_signature(sums, signature, keyring, fingerprints, *, run=subprocess.r
                          capture_output=True, text=True, timeout=60, check=False)
         except (OSError, subprocess.TimeoutExpired):
             raise VerifyError('无法运行 gpgv，没法校验签名（需要软件包 gpgv）。')
-    valid = []
+    valid, unknown = [], 0
     for line in result.stdout.splitlines():
         if not line.startswith('[GNUPG:] '):
             continue
         fields = line[len('[GNUPG:] '):].split()
         if fields and fields[0] in BAD_STATUS:
             raise VerifyError(f'签名校验失败（{fields[0]}）。')
+        if fields and fields[0] == 'ERRSIG':
+            # ERRSIG <keyid> <pk-algo> <hash-algo> <class> <time> <reason> <fpr>
+            if len(fields) < 7 or fields[6] != MISSING_KEY:
+                raise VerifyError('签名校验失败（ERRSIG：不是缺少公钥，而是别的原因）。')
+            unknown += 1  # a signature by a key this install does not know: see below
         if fields and fields[0] == 'VALIDSIG':
             valid.append(fields)
-    if result.returncode != 0 or not valid:
+    # While the release key is being replaced a release carries two signatures, and an install
+    # that still has only the old key cannot check the new one.  That is fine: what counts is
+    # that one signature is valid and from a pinned key.  gpgv then exits with 2 instead of 0.
+    if not valid or result.returncode not in ((0, 2) if unknown else (0,)):
         raise VerifyError('签名校验失败：没有来自发布密钥的有效签名。')
     trusted = {fingerprint.upper() for fingerprint in fingerprints}
     for fields in valid:
