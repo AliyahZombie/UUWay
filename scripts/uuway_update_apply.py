@@ -21,12 +21,14 @@ import os
 from pathlib import Path
 import pwd
 import re
+import shlex
 import shutil
 import stat
 import subprocess
 import sys
 import tempfile
 import time
+import traceback
 
 # The keyring that the installed package ships.  It is read before dpkg replaces the tree,
 # so a package that rotates the key is still verified with the key that is already trusted.
@@ -147,6 +149,24 @@ def deb_control(deb, *, run=subprocess.run):
     return fields
 
 
+def check_signed_checksums(stage, tag, keyring, fingerprints, *, run=subprocess.run):
+    """The signature on SHA256SUMS and the checksum it lists for this release's deb.
+
+    Needs only the two small files, so the updater can run it before the deb is downloaded.
+    """
+    stage = Path(stage)
+    match = TAG.fullmatch(tag)
+    if not match:
+        raise VerifyError(f'发布标签（tag）必须形如 vX.Y.Z，收到的是 {tag!r}。')
+    sums, signature = stage / 'SHA256SUMS', stage / 'SHA256SUMS.asc'
+    for required in (sums, signature):
+        if not required.is_file():
+            what = '签名文件' if required == signature else '文件'
+            raise VerifyError(f'缺少{what} {required.name}（这个版本可能还没有签名）。')
+    verify_signature(sums, signature, keyring, fingerprints, run=run)
+    return parse_sums(sums.read_text(), deb_name(match.group(1)))
+
+
 def check_release(stage, tag, installed, keyring, fingerprints, *, run=subprocess.run):
     """Verify a staged download; return a Release or raise VerifyError.
 
@@ -160,13 +180,11 @@ def check_release(stage, tag, installed, keyring, fingerprints, *, run=subproces
         raise VerifyError(f'发布标签（tag）必须形如 vX.Y.Z，收到的是 {tag!r}。')
     version = match.group(1)
     name = deb_name(version)
-    sums, signature, deb = stage / 'SHA256SUMS', stage / 'SHA256SUMS.asc', stage / name
-    for required in (sums, signature, deb):
-        if not required.is_file():
-            what = '签名文件' if required == signature else '文件'
-            raise VerifyError(f'缺少{what} {required.name}（这个版本可能还没有签名）。')
-    verify_signature(sums, signature, keyring, fingerprints, run=run)
-    expected = parse_sums(sums.read_text(), name)
+    deb = stage / name
+    # The signature first, and before the deb is even looked for: nothing in an unsigned file is believed.
+    expected = check_signed_checksums(stage, tag, keyring, fingerprints, run=run)
+    if not deb.is_file():
+        raise VerifyError(f'缺少文件 {name}。')
     actual = sha256_file(deb)
     if actual != expected:
         raise VerifyError(f'{name} 的 SHA-256 与已签名的 SHA256SUMS 不一致（哈希 {actual}），拒绝安装。')
@@ -269,11 +287,16 @@ def read_json(path, limit=1 << 20):
 
 
 class Journal:
-    """What has been done so far, on disk, so a reboot in the middle can be picked up again."""
+    """What has been done so far, on disk, so a reboot in the middle can be picked up again.
 
-    def __init__(self, path, data):
+    A new one is kept in memory until the update is committed to (`persist = True`): an attempt
+    that is refused must not replace the journal of the last update that really happened.
+    """
+
+    def __init__(self, path, data, persist=True):
         self.path = Path(path)
         self.data = data
+        self.persist = persist
 
     @classmethod
     def load(cls, path):
@@ -282,7 +305,12 @@ class Journal:
 
     def update(self, **fields):
         self.data.update(fields, updated=time.time())
-        write_json(self.path, self.data, 0o600)
+        if self.persist:
+            write_json(self.path, self.data, 0o600)
+
+    def commit(self, **fields):
+        self.persist = True
+        self.update(**fields)
 
     def get(self, key, default=None):
         return self.data.get(key, default)
@@ -315,6 +343,7 @@ class Job:
         self.log = log or (lambda text: print(text, flush=True))
         self.session_env = {}
         self.journal = None
+        self.manual = False  # a rollback somebody asked for, not one the update decided on
 
     @property
     def version(self):
@@ -555,7 +584,10 @@ def wait_healthy(job, baseline):
         if drops:
             deadline = max(deadline, started + LONG_DEADLINE)
         if now >= deadline:
-            return Verdict(False, '、'.join(problems), notes)
+            # Healthy at this moment but not yet for SOAK seconds on end: keep watching, up to a
+            # hard stop, rather than roll back a machine that is working.
+            if problems or now >= started + LONG_DEADLINE:
+                return Verdict(False, '、'.join(problems) or f'到期时还没有连续稳定满 {SOAK} 秒', notes)
         job.sleep(POLL)
 
 
@@ -626,19 +658,32 @@ def repack_installed(job, version):
             if source.is_file():
                 shutil.copy2(source, tree / 'DEBIAN' / name)
                 os.chmod(tree / 'DEBIAN' / name, 0o644 if name == 'md5sums' else 0o755)
-        for old in layout.previous.iterdir():
-            old.unlink()
-        deb = layout.previous / deb_name(version)
+        # Built in the working area: the saved copy of the last update stays where it is until this
+        # update is committed to (commit_previous), so a refused attempt cannot cost the way back.
+        deb = Path(tempfile.mkdtemp(prefix='previous-', dir=layout.work)) / deb_name(version)
         built = job.run(['dpkg-deb', '--root-owner-group', '-Zgzip', '-z1', '-b', str(tree), str(deb)], timeout=600)
         if built.returncode != 0:
             raise TransactionError(f'重新打包失败：{built.stderr.strip()[-200:]}')
-        os.chmod(deb, 0o644)
-        readable = job.run(['dpkg-deb', '--fsys-tarfile', str(deb)], text=False, timeout=600)
+        # The listing itself is not wanted, only whether it can be read: keep it out of memory.
+        readable = job.run(['dpkg-deb', '--fsys-tarfile', str(deb)], capture_output=False,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, timeout=600)
         if readable.returncode != 0 or deb_control(deb, run=job.run).get('Version') != version:
             raise TransactionError('重新打包出的旧版本读不回来。')
     finally:
         shutil.rmtree(tree, ignore_errors=True)
     return deb, sha256_file(deb)
+
+
+def commit_previous(layout, built):
+    """Save `built` as the copy of the version being replaced; returns its final path.
+
+    Copies saved earlier stay until the update ends (finish_with prunes): if it turns out that
+    nothing changed, the earlier one is still the way back.
+    """
+    target = layout.previous / built.name
+    os.replace(built, target)
+    os.chmod(target, 0o644)
+    return target
 
 
 def simulation_is_safe(output):
@@ -676,34 +721,75 @@ def disarm_resume(job):
 
 
 def write_recovery(job, reason):
+    """Notes for whoever finds the machine in a bad state: what to run, in order.
+
+    Every step is only written when it can be done: copying a snapshot that does not exist would
+    be copying whatever the empty path happens to name.
+    """
     journal = job.journal
-    text = f'''UUWay 更新（{journal.get('from_version')} → {journal.get('version')}）没有成功，自动回滚也没有恢复：
-{reason}
-
-现在这台机器上装的可能是任何一个版本。请在本机或能登录的地方按顺序执行：
-
-1. sudo dpkg --configure -a
-2. sudo apt-get install --allow-downgrades {journal.get('previous_deb')}
-3. 用普通用户（不要用 root）恢复更新前的快照：
-   cp -a {job.snapshot}/home/. ~/
-4. systemctl --user daemon-reload && uuway refresh --yes
-
-日志：journalctl -u uuway-update ；进度记录：{job.layout.progress}
-'''
-    job.layout.recovery.write_text(text)
+    previous = journal.get('previous_deb')
+    steps = ['sudo dpkg --configure -a']
+    if previous:
+        steps.append(f'sudo apt-get install --allow-downgrades {shlex.quote(str(previous))}')
+    else:
+        steps.append('没有保存下来的旧版本包：到 https://github.com/GaryOAO/UUWay/releases 下载更新前的版本，'
+                     '再 sudo apt install ./那个文件.deb')
+    if job.snapshot:
+        steps.append('用普通用户（不要用 root）恢复更新前的快照：\n'
+                     f'   cp -a {shlex.quote(job.snapshot + "/home/.")} ~/')
+    else:
+        steps.append('没有更新前的快照可以恢复，配置文件保持现状。')
+    steps.append('systemctl --user daemon-reload && uuway refresh --yes')
+    what = '手动回滚' if job.manual else f"更新（{journal.get('from_version')} → {journal.get('version')}）"
+    numbered = '\n'.join(f'{number}. {step}' for number, step in enumerate(steps, 1))
+    job.layout.recovery.write_text(
+        f'UUWay {what}没有成功，自动回滚也没有恢复：\n{reason}\n\n'
+        f'现在这台机器上装的可能是任何一个版本。请在本机或能登录的地方按顺序执行：\n\n{numbered}\n\n'
+        f'日志：journalctl -u uuway-update ；进度记录：{job.layout.progress}\n')
     os.chmod(job.layout.recovery, 0o644)
+
+
+def earlier_rollback_target(layout):
+    """The way back that the last update that really happened left, if its deb is still there."""
+    old = read_json(layout.result)
+    candidate = old.get('rollback_to') if isinstance(old, dict) else None
+    if isinstance(candidate, dict) and Path(str(candidate.get('deb') or '/nonexistent')).is_file():
+        return candidate
+    return None
+
+
+def rollback_target(job, outcome):
+    """What `uuway update rollback` can go back to once this has ended with `outcome`.
+
+    An update that went ahead leaves the version it replaced.  One that never started (even if it
+    got as far as saving a copy) changed nothing, so the way back is still the earlier one.
+    """
+    journal = job.journal
+    if outcome != 'not_started' and journal is not None and journal.persist and journal.get('previous_deb'):
+        return dict(version=journal.get('from_version'), deb=journal.get('previous_deb'), snapshot=job.snapshot)
+    return earlier_rollback_target(job.layout)
+
+
+def prune_previous(layout, keep):
+    for saved in layout.previous.glob('*'):
+        if str(saved) not in keep:
+            saved.unlink(missing_ok=True)
 
 
 def finish_with(job, outcome, message, **extra):
     """Record how it ended, undo the boot-time resume, and clear the working files."""
     journal = job.journal
     recovery = job.layout.recovery if outcome == 'rollback_failed' else None
+    target = rollback_target(job, outcome)
     data = dict(schema=1, outcome=outcome, message=message, tag=job.tag, finished=time.time(),
-                from_version=journal.get('from_version') if journal else None,
-                to_version=job.version, snapshot=job.snapshot,
-                previous_deb=journal.get('previous_deb') if journal else None,
+                manual=job.manual, from_version=journal.get('from_version') if journal else None,
+                to_version=job.version, snapshot=job.snapshot, rollback_to=target,
                 log=str(job.layout.progress), recovery=str(recovery) if recovery else None, **extra)
     write_json(job.layout.result, data)
+    if outcome in ('success', 'not_started') and journal is not None and journal.persist:
+        # One saved copy is kept: what a successful update replaced, or (for one that was committed to
+        # but changed nothing) the earlier one, never a copy of the version that is installed anyway.
+        prune_previous(job.layout, {target['deb']} if target else set())
     job.log(f'结果：{outcome}：{message}')
     if journal:
         journal.update(phase='done')
@@ -724,8 +810,9 @@ def give_up(job, reason):
         job.log(f'{reason}；按 --reboot-if-stuck 的要求重启一次。')
         write_json(job.layout.result, dict(schema=1, outcome='rollback_failed', message=reason + '（正在重启）',
                                            tag=job.tag, finished=time.time(), recovery=str(job.layout.recovery),
-                                           from_version=journal.get('from_version'), to_version=job.version,
-                                           snapshot=job.snapshot, previous_deb=journal.get('previous_deb'),
+                                           manual=job.manual, from_version=journal.get('from_version'),
+                                           to_version=job.version, snapshot=job.snapshot,
+                                           rollback_to=rollback_target(job, 'rollback_failed'),
                                            log=str(job.layout.progress)))
         job.run(['systemctl', 'reboot', '--ignore-inhibitors'])
         return 'rebooting'
@@ -792,15 +879,20 @@ def complete_update(job):
 
 
 def run_update(job, stage, *, verify=check_release):
-    """Verify, back up, install; then complete_update decides between success and rollback."""
+    """Verify, back up, install; then complete_update decides between success and rollback.
+
+    Nothing that belongs to the last update that really happened (its journal, the saved copy of
+    the version it replaced) is touched until this one is committed to, just before apt runs: an
+    attempt that is refused must leave the way back where it was.
+    """
     layout, log = job.layout, job.log
     layout.prepare()
     installed = installed_version(job)
     job.journal = Journal(layout.journal, dict(schema=1, phase='starting', tag=job.tag, version=job.version,
                                                from_version=installed, user=job.user, uid=job.uid, home=job.home,
                                                prefix=job.prefix, snapshot=job.snapshot, baseline=job.baseline,
-                                               reboot_if_stuck=job.reboot_if_stuck, started=time.time()))
-    job.journal.update(phase='starting')
+                                               reboot_if_stuck=job.reboot_if_stuck, manual=False,
+                                               started=time.time()), persist=False)
     log(f'开始更新 {installed} → {job.version}')
     if installed is None:
         return finish_with(job, 'not_started', '没有找到已安装的 uuway 软件包。')
@@ -808,25 +900,25 @@ def run_update(job, stage, *, verify=check_release):
         work = Path(tempfile.mkdtemp(prefix='stage-', dir=layout.work))
         copy_stage(job, stage, work)
         release = verify(work, job.tag, installed, KEYRING, TRUSTED_FINGERPRINTS, run=job.check_run)
-        new = layout.new / release.deb.name
+        # Moved, not copied: it was verified where only root can write, and a move leaves it as it was.
         for old in layout.new.iterdir():
             old.unlink()
-        shutil.copyfile(release.deb, new)
+        new = layout.new / release.deb.name
+        os.replace(release.deb, new)
         os.chmod(new, 0o644)
-        if sha256_file(new) != release.sha256:
-            raise VerifyError('复制后的 deb 与校验过的不一致。')
     except (VerifyError, OSError) as error:
         return finish_with(job, 'not_started', str(error))
     log('签名、哈希和版本检查通过。')
     try:
-        previous, previous_sha = repack_installed(job, installed)
+        built, previous_sha = repack_installed(job, installed)
     except (TransactionError, OSError) as error:
         return finish_with(job, 'not_started', f'没法备好回滚用的旧版本，所以没有开始：{error}')
     log(f'已备好回滚用的 {installed}。')
     simulated = job.run(['apt-get', '-s', 'install', '-y', '--no-install-recommends', str(new)], timeout=600)
     if simulated.returncode != 0 or not simulation_is_safe(simulated.stdout):
         return finish_with(job, 'not_started', '模拟安装显示它会动 uuway 以外的软件包，或装不上，所以没有开始。')
-    job.journal.update(phase='prepared', previous_deb=str(previous), previous_sha256=previous_sha,
+    previous = commit_previous(layout, built)
+    job.journal.commit(phase='prepared', previous_deb=str(previous), previous_sha256=previous_sha,
                        new_deb=str(new), new_sha256=release.sha256)
     arm_resume(job)
     job.journal.update(phase='apt')
@@ -842,6 +934,49 @@ def run_update(job, stage, *, verify=check_release):
     if now != release.version:
         return rollback(job, f'安装后版本是 {now}，不是 {release.version}')
     return complete_update(job)
+
+
+def run_manual_rollback(job):
+    """`uuway update rollback`: the same protection against a power cut as an update has."""
+    job.manual = True
+    job.journal.update(manual=True)
+    arm_resume(job)
+    return guarded(job, lambda: rollback(job, '按要求手动回滚'))
+
+
+def emergency(job, error):
+    """Something nobody expected went wrong: undo what may have been done, and say so."""
+    journal = job.journal
+    phase = journal.get('phase') if journal is not None and journal.persist else None
+    try:
+        if phase in ('apt', 'installed', 'refreshed', 'rolling_back'):
+            return rollback(job, f'更新程序出错：{error}')
+        return finish_with(job, 'not_started', f'更新程序出错，系统没有改变：{error}')
+    except Exception as second:  # noqa: BLE001 - the last line of defence has to catch everything
+        job.log(f'兜底处理也失败了：{second!r}')
+        reason = f'更新程序出错：{error}；兜底回滚也失败：{second}'
+        for record in (lambda: write_recovery(job, reason),
+                       lambda: write_json(job.layout.result, dict(
+                           schema=1, outcome='rollback_failed', message=reason, tag=job.tag, finished=time.time(),
+                           manual=job.manual, from_version=journal.get('from_version') if journal else None,
+                           to_version=job.version, snapshot=job.snapshot, rollback_to=None,
+                           log=str(job.layout.progress), recovery=str(job.layout.recovery)))):
+            try:
+                record()
+            except Exception:  # noqa: BLE001 - nothing more can be done, and nothing must stop the other record
+                pass
+        return 'rollback_failed'
+
+
+def guarded(job, action):
+    """Run `action`; an unexpected exception still ends in a rollback (when the package may have
+    changed) and a recorded result, instead of a traceback and a machine in an unknown state."""
+    try:
+        return action()
+    except Exception as error:  # noqa: BLE001
+        traceback.print_exc()
+        job.log(f'更新程序出错：{error!r}')
+        return emergency(job, error)
 
 
 def after_reboot(job):
@@ -911,6 +1046,7 @@ def job_from_journal(layout, journal, **overrides):
               reboot_if_stuck=overrides.pop('reboot_if_stuck', data.get('reboot_if_stuck', False)),
               log=progress_logger(layout), **overrides)
     job.journal = journal
+    job.manual = bool(data.get('manual'))
     return job
 
 
@@ -959,17 +1095,17 @@ def main(argv=None):
         elif not isinstance(baseline, dict) or not isinstance(baseline.get('units'), dict):
             outcome = finish_with(job, 'not_started', '更新前的健康基线读不出来。')
         else:
-            outcome = run_update(job, args.stage)
+            outcome = guarded(job, lambda: run_update(job, args.stage))
     else:
         journal = Journal.load(layout.journal)
         if journal is None:
             log('没有更新记录。')
             return 1
         if args.mode == 'resume':
-            outcome = resume(job_from_journal(layout, journal))
+            job = job_from_journal(layout, journal)
+            outcome = guarded(job, lambda: resume(job))
         else:
-            job = job_from_journal(layout, journal, reboot_if_stuck=args.reboot_if_stuck)
-            outcome = rollback(job, '按要求手动回滚')
+            outcome = run_manual_rollback(job_from_journal(layout, journal, reboot_if_stuck=args.reboot_if_stuck))
     return 0 if outcome in ('success', 'rolled_back', 'nothing') else 1
 
 

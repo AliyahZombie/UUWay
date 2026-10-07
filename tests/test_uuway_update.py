@@ -93,6 +93,29 @@ class CheckReleaseTests(Workspace):
         self.assertEqual(result.deb.name, "uuway_1.2.1_amd64.deb")
         self.assertEqual(result.sha256, hashlib.sha256(result.deb.read_bytes()).hexdigest())
 
+    def test_the_signed_checksums_can_be_checked_without_the_deb(self):
+        stage = self.release(self.home)
+        digest = apply.check_signed_checksums(stage, "v1.2.1", self.keyring, (self.fingerprint,))
+        self.assertEqual(digest, hashlib.sha256((stage / "uuway_1.2.1_amd64.deb").read_bytes()).hexdigest())
+        (stage / "uuway_1.2.1_amd64.deb").unlink()  # not needed for this
+        self.assertEqual(apply.check_signed_checksums(stage, "v1.2.1", self.keyring, (self.fingerprint,)), digest)
+
+    def test_that_early_check_refuses_what_the_full_check_refuses(self):
+        other_home, _, _ = self.make_key("intruder")
+        for stage, expected in ((self.release(other_home, version="1.2.3"), apply.VerifyError),
+                                (self.release(self.home, version="1.2.4", sign=False), apply.VerifyError)):
+            tag = f"v{stage.name.removeprefix('stage-')}"
+            with self.assertRaises(expected, msg=tag):
+                apply.check_signed_checksums(stage, tag, self.keyring, (self.fingerprint,))
+        with self.assertRaisesRegex(apply.VerifyError, "tag"):
+            apply.check_signed_checksums(self.release(self.home, version="1.2.5"), "v1.2", self.keyring, (self.fingerprint,))
+
+    def test_the_full_check_still_stops_at_a_bad_signature_first(self):
+        other_home, _, _ = self.make_key("intruder")
+        stage = self.release(other_home)
+        with self.assertRaisesRegex(apply.VerifyError, "签名|指纹"):
+            self.check(stage)
+
     def test_a_changed_deb_is_refused(self):
         stage = self.release(self.home)
         with (stage / "uuway_1.2.1_amd64.deb").open("ab") as deb:

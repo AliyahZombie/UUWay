@@ -240,10 +240,9 @@ class UpdateCase(unittest.TestCase):
             (self.stage / name).write_bytes(data)
 
         def repack(job, version):
-            self.layout.previous.mkdir(parents=True, exist_ok=True)
-            deb = self.layout.previous / apply.deb_name(version)
-            deb.write_bytes(b"previous package")
-            return deb, hashlib.sha256(b"previous package").hexdigest()
+            built = Path(tempfile.mkdtemp(prefix="repack-", dir=self.layout.work)) / apply.deb_name(version)
+            built.write_bytes(b"previous package")
+            return built, hashlib.sha256(b"previous package").hexdigest()
 
         def verify(work, tag, installed, keyring, fingerprints, *, run):
             self.verified = (tag, installed)
@@ -258,15 +257,23 @@ class UpdateCase(unittest.TestCase):
             self.addCleanup(patcher.stop)
 
     def job(self, **options):
+        options.setdefault("tag", "v1.2.1")
+        options.setdefault("snapshot", str(self.snapshot))
         return apply.Job(self.layout, user="alice", uid=UID, home=str(self.home), prefix=str(self.home / "prefix"),
-                         tag="v1.2.1", snapshot=str(self.snapshot), baseline=self.baseline, run=self.machine,
-                         check_run=self.machine, clock=self.clock.now, sleep=self.clock.sleep,
-                         log=self.logs.append, **options)
+                         baseline=self.baseline, run=self.machine, check_run=self.machine, clock=self.clock.now,
+                         sleep=self.clock.sleep, log=self.logs.append, **options)
 
-    def update(self, **options):
+    def update(self, stage=None, **options):
         job = self.job(**options)
-        outcome = apply.run_update(job, self.stage, verify=self.verify)
+        outcome = apply.run_update(job, stage or self.stage, verify=self.verify)
         return outcome, job
+
+    def stage_for(self, version):
+        stage = self.root / f"stage-{version}"
+        stage.mkdir()
+        for name, data in (("SHA256SUMS", b"sums"), ("SHA256SUMS.asc", b"sig"), (f"uuway_{version}_amd64.deb", b"pkg " + version.encode())):
+            (stage / name).write_bytes(data)
+        return stage
 
     def result(self):
         return json.loads(self.layout.result.read_text())
@@ -528,11 +535,15 @@ class RollbackTests(UpdateCase):
     def test_a_missing_old_package_falls_back_to_restoring_the_snapshot(self):
         self.machine.bad_versions.add("1.2.1")
 
-        def no_copy(job, version):
-            self.layout.previous.mkdir(parents=True, exist_ok=True)
-            return self.layout.previous / "uuway_1.2.0_amd64.deb", "0" * 64  # nothing there
-        with patch.object(apply, "repack_installed", no_copy):
-            outcome, _ = self.update()
+        original = self.machine.__call__
+
+        def vanish(argv, **kwargs):
+            if argv[0] == "apt-get" and "-s" not in argv and "install" in argv and "--allow-downgrades" not in argv:
+                for saved in self.layout.previous.glob("*.deb"):
+                    saved.unlink()  # the saved copy is gone by the time it is needed
+            return original(argv, **kwargs)
+        self.machine.__class__ = type("Vanishing", (Machine,), {"__call__": lambda me, argv, **kw: vanish(argv, **kw)})
+        outcome, _ = self.update()
         self.assertFalse(self.machine.ran("--allow-downgrades"))
         self.assertTrue(self.machine.ran("restart", "uu-native-bridge.service"))
         self.assertEqual(self.machine.version, "1.2.1")
@@ -543,13 +554,194 @@ class RollbackTests(UpdateCase):
         self.machine.bad_versions.add("1.2.1")
 
         def corrupt(job, version):
-            self.layout.previous.mkdir(parents=True, exist_ok=True)
-            deb = self.layout.previous / "uuway_1.2.0_amd64.deb"
-            deb.write_bytes(b"tampered")
-            return deb, hashlib.sha256(b"original").hexdigest()
+            built = Path(tempfile.mkdtemp(prefix="repack-", dir=self.layout.work)) / "uuway_1.2.0_amd64.deb"
+            built.write_bytes(b"tampered")
+            return built, hashlib.sha256(b"original").hexdigest()
         with patch.object(apply, "repack_installed", corrupt):
             self.update()
         self.assertFalse(self.machine.ran("--allow-downgrades"))
+
+
+class RollbackTargetTests(UpdateCase):
+    """The way back to the version before the last update is not thrown away by a later attempt."""
+
+    def succeed_once(self):
+        outcome, _ = self.update()
+        self.assertEqual(outcome, "success")
+        self.assertEqual(self.machine.version, "1.2.1")
+
+    def assert_old_target_survives(self):
+        saved = self.layout.previous / "uuway_1.2.0_amd64.deb"
+        self.assertTrue(saved.is_file(), "the saved 1.2.0 is gone")
+        result = self.result()
+        self.assertEqual(result["outcome"], "not_started")
+        self.assertEqual(result["rollback_to"]["version"], "1.2.0")
+        self.assertEqual(result["rollback_to"]["deb"], str(saved))
+        self.assertEqual(self.journal()["version"], "1.2.1")  # still the journal of the update that happened
+        self.assertEqual(self.journal()["phase"], "done")
+
+    def test_an_attempt_the_apt_simulation_refuses_keeps_it(self):
+        self.succeed_once()
+        self.machine.simulation = "Inst uuway [1.2.1] (1.2.2 now)\nInst fcitx5 (5.1 now)\n"
+        outcome, _ = self.update(self.stage_for("1.2.2"), tag="v1.2.2")
+        self.assertEqual(outcome, "not_started")
+        self.assert_old_target_survives()
+
+    def test_an_attempt_that_cannot_be_repacked_keeps_it(self):
+        self.succeed_once()
+
+        def cannot(job, version):
+            raise apply.TransactionError("磁盘满了")
+        with patch.object(apply, "repack_installed", cannot):
+            outcome, _ = self.update(self.stage_for("1.2.2"), tag="v1.2.2")
+        self.assertEqual(outcome, "not_started")
+        self.assert_old_target_survives()
+
+    def test_an_attempt_that_fails_verification_keeps_it(self):
+        self.succeed_once()
+
+        def refuse(*args, **kwargs):
+            raise apply.VerifyError("签名校验失败")
+        outcome = apply.run_update(self.job(tag="v1.2.2"), self.stage_for("1.2.2"), verify=refuse)
+        self.assertEqual(outcome, "not_started")
+        self.assert_old_target_survives()
+
+    def test_an_update_that_goes_ahead_replaces_it_with_the_version_it_replaced(self):
+        self.succeed_once()
+        outcome, _ = self.update(self.stage_for("1.2.2"), tag="v1.2.2")
+        self.assertEqual(outcome, "success")
+        self.assertEqual([path.name for path in self.layout.previous.iterdir()], ["uuway_1.2.1_amd64.deb"])
+        self.assertEqual(self.result()["rollback_to"]["version"], "1.2.1")
+
+    def test_a_first_attempt_that_is_refused_has_nothing_to_roll_back_to(self):
+        def refuse(*args, **kwargs):
+            raise apply.VerifyError("签名校验失败")
+        apply.run_update(self.job(), self.stage, verify=refuse)
+        self.assertIsNone(self.result()["rollback_to"])
+        self.assertFalse(self.layout.journal.exists())
+
+    def test_a_result_that_names_a_missing_deb_is_not_carried_over(self):
+        self.succeed_once()
+        for saved in self.layout.previous.glob("*.deb"):
+            saved.unlink()
+        self.machine.simulation = ""
+        self.update(self.stage_for("1.2.2"), tag="v1.2.2")
+        self.assertIsNone(self.result()["rollback_to"])
+
+
+class HealthDeadlineTests(UpdateCase):
+    def test_a_machine_that_is_healthy_but_late_gets_the_time_it_needs_to_settle(self):
+        started = self.clock.now()
+        self.machine.bridge_up = False
+
+        def comes_up_late():
+            if self.clock.now() - started >= 250:
+                self.machine.bridge_up = True
+        self.machine.after_show = comes_up_late
+        verdict = apply.wait_healthy(self.job(), self.baseline)
+        self.assertTrue(verdict.healthy)  # healthy from 250 s, calm for 90 s more: past the 300 s mark
+        self.assertGreater(self.clock.now() - started, apply.DEADLINE)
+
+    def test_running_out_of_time_while_still_restarting_says_so(self):
+        looks = []
+
+        def restart_every_minute():
+            looks.append(1)
+            if len(looks) % 12 == 0:
+                self.machine.restarts += 1  # it is up every time anybody looks, but the calm never lasts
+        self.machine.after_show = restart_every_minute
+        verdict = apply.wait_healthy(self.job(), self.baseline)
+        self.assertFalse(verdict.healthy)
+        self.assertNotEqual(verdict.reason, "")
+        self.assertIn("90", verdict.reason)
+
+
+class ManualRollbackTests(UpdateCase):
+    def committed(self):
+        self.update()
+        self.assertEqual(self.machine.version, "1.2.1")
+        self.logs.clear()
+
+    def manual(self, **options):
+        journal = apply.Journal.load(self.layout.journal)
+        job = apply.job_from_journal(self.layout, journal, run=self.machine, check_run=self.machine,
+                                     clock=self.clock.now, sleep=self.clock.sleep, **options)
+        return apply.run_manual_rollback(job)
+
+    def test_it_is_recorded_as_a_deliberate_rollback_not_a_failed_update(self):
+        self.committed()
+        self.assertEqual(self.manual(), "rolled_back")
+        result = self.result()
+        self.assertTrue(result["manual"])
+        self.assertEqual(self.machine.version, "1.2.0")
+        self.assertNotIn("更新后", result["message"])
+
+    def test_an_automatic_rollback_is_not_marked_manual(self):
+        self.machine.bad_versions.add("1.2.1")
+        self.update()
+        self.assertFalse(self.result()["manual"])
+
+    def test_it_has_the_same_protection_against_a_power_cut_as_an_update(self):
+        self.committed()
+        seen = []
+        original = self.machine.__call__
+
+        def spy(argv, **kwargs):
+            if "--allow-downgrades" in argv:
+                seen.append(self.resume_armed())  # armed while the package is being replaced
+            return original(argv, **kwargs)
+        self.machine.__class__ = type("Spy", (Machine,), {"__call__": lambda me, argv, **kw: spy(argv, **kw)})
+        self.manual()
+        self.assertEqual(seen, [True])
+        self.assertFalse(self.resume_armed())  # and removed again afterwards
+
+    def test_a_rollback_that_was_interrupted_is_picked_up_again_at_boot(self):
+        self.committed()
+        journal = apply.Journal.load(self.layout.journal)
+        journal.update(phase="rolling_back", reason="按要求手动回滚")
+        job = apply.job_from_journal(self.layout, journal, run=self.machine, check_run=self.machine,
+                                     clock=self.clock.now, sleep=self.clock.sleep)
+        self.assertEqual(apply.resume(job), "rolled_back")
+
+
+class UnexpectedErrorTests(UpdateCase):
+    def test_an_unexpected_error_after_the_install_still_ends_in_a_rollback_and_a_result(self):
+        raised = []
+
+        def explode_once():
+            if not raised:
+                raised.append(1)
+                raise KeyError("something nobody expected")
+        self.machine.after_show = explode_once
+        job = self.job()
+        outcome = apply.guarded(job, lambda: apply.run_update(job, self.stage, verify=self.verify))
+        self.assertEqual(outcome, "rolled_back")
+        self.assertEqual(self.machine.version, "1.2.0")
+        self.assertIn("更新程序出错", self.result()["message"])
+        self.assertFalse(self.resume_armed())
+
+    def test_an_unexpected_error_before_the_install_changes_nothing_and_says_so(self):
+        def explode(job, version):
+            raise RuntimeError("something nobody expected")
+        job = self.job()
+        with patch.object(apply, "repack_installed", explode):
+            outcome = apply.guarded(job, lambda: apply.run_update(job, self.stage, verify=self.verify))
+        self.assertEqual(outcome, "not_started")
+        self.assertEqual(self.machine.version, "1.2.0")
+        self.assertFalse([argv for argv in self.machine.ran("apt-get", "install") if "-s" not in argv])
+        self.assertEqual(self.result()["outcome"], "not_started")
+
+    def test_an_error_inside_the_rollback_itself_is_recorded_as_a_failed_rollback(self):
+        self.machine.bad_versions.add("1.2.1")
+
+        def explode(*args, **kwargs):
+            raise OSError("no space left on device")
+        job = self.job()
+        with patch.object(apply, "wait_healthy", side_effect=[apply.Verdict(False, "坏了", []), OSError("disk full")]):
+            outcome = apply.guarded(job, lambda: apply.run_update(job, self.stage, verify=self.verify))
+        self.assertEqual(outcome, "rollback_failed")
+        self.assertEqual(self.result()["outcome"], "rollback_failed")
+        self.assertTrue(self.layout.recovery.is_file())
 
 
 class WhenTheRollbackFailsTests(UpdateCase):
@@ -566,6 +758,22 @@ class WhenTheRollbackFailsTests(UpdateCase):
                          f"cp -a {self.snapshot}/home/. ~/", "uuway refresh --yes"):
             self.assertIn(expected, recovery)
         self.assertEqual(self.result()["recovery"], str(self.layout.recovery))
+
+    def test_without_a_snapshot_the_recovery_notes_do_not_tell_anyone_to_copy_a_directory(self):
+        self.break_everything()
+        self.update(snapshot="")
+        recovery = self.layout.recovery.read_text()
+        self.assertNotIn("cp -a", recovery)
+        self.assertNotIn("/home/.", recovery)
+        self.assertIn("没有更新前的快照", recovery)
+        self.assertIn("uuway refresh --yes", recovery)
+
+    def test_a_snapshot_path_with_spaces_is_quoted_in_the_recovery_notes(self):
+        self.break_everything()
+        spaced = self.root / "a snapshot"
+        (spaced / "home").mkdir(parents=True)
+        self.update(snapshot=str(spaced))
+        self.assertIn(f"cp -a '{spaced}/home/.' ~/", self.layout.recovery.read_text())
 
     def test_it_reboots_once_when_asked_and_judges_again_afterwards(self):
         self.break_everything()
@@ -656,16 +864,24 @@ class RepackTests(unittest.TestCase):
             status = ("Package: uuway\nStatus: install ok installed\nVersion: 1.2.0\nArchitecture: amd64\n"
                       "Maintainer: test <t@example.invalid>\nConfig-Version: 1.2.0\nDescription: test\n long line\n")
 
+            readings = []
+
             def run(argv, **kwargs):
                 if argv[:2] == ["dpkg-query", "-s"]:
                     return completed(argv, 0, status)
+                if "--fsys-tarfile" in argv:
+                    readings.append(kwargs)
                 return apply.run_command(argv, **kwargs)
             layout = apply.Layout(base / "state", dpkg_info=info, root=system)
             layout.prepare()
             job = apply.Job(layout, user="alice", uid=UID, home=str(base), prefix=str(base), run=run)
             deb, digest = apply.repack_installed(job, "1.2.0")
-            self.assertEqual(deb, layout.previous / "uuway_1.2.0_amd64.deb")
+            self.assertEqual(deb.parent.parent, layout.work)  # built in the working area, not yet the saved copy
+            self.assertEqual(list(layout.previous.iterdir()), [])
             self.assertEqual(digest, apply.sha256_file(deb))
+            (reading,) = readings  # the read-back check keeps the package's contents out of memory
+            self.assertIs(reading["stdout"], subprocess.DEVNULL)
+            self.assertFalse(reading.get("capture_output"))
             self.assertEqual(apply.deb_control(deb), {"Package": "uuway", "Version": "1.2.0", "Architecture": "amd64"})
             contents = subprocess.run(["dpkg-deb", "-c", str(deb)], capture_output=True, text=True, check=True).stdout
             self.assertIn("./usr/lib/uuway/scripts/uuway_cli.py", contents)
@@ -679,8 +895,13 @@ class RepackTests(unittest.TestCase):
             subprocess.run(["dpkg-deb", "-e", str(deb), str(extracted)], check=True)
             self.assertTrue((extracted / "md5sums").is_file())
             self.assertTrue(os.access(extracted / "postinst", os.X_OK))
+            saved = apply.commit_previous(layout, deb)
+            self.assertEqual(saved, layout.previous / "uuway_1.2.0_amd64.deb")
+            self.assertTrue(saved.is_file())
+            self.assertFalse(deb.exists())  # moved, not copied
+            self.assertEqual(saved.stat().st_mode & 0o777, 0o644)
 
-    def test_only_one_old_copy_is_kept(self):
+    def test_repacking_leaves_the_saved_copy_of_the_last_update_alone(self):
         if not shutil.which("dpkg-deb"):
             self.skipTest("dpkg-deb is needed")
         with tempfile.TemporaryDirectory() as directory:
@@ -694,8 +915,11 @@ class RepackTests(unittest.TestCase):
             job = apply.Job(layout, user="a", uid=UID, home=str(base), prefix=str(base),
                             run=lambda argv, **kw: completed(argv, 0, status) if argv[:2] == ["dpkg-query", "-s"]
                             else apply.run_command(argv, **kw))
-            apply.repack_installed(job, "1.2.0")
-            self.assertEqual([p.name for p in layout.previous.iterdir()], ["uuway_1.2.0_amd64.deb"])
+            built, _ = apply.repack_installed(job, "1.2.0")
+            self.assertEqual([p.name for p in layout.previous.iterdir()], ["uuway_1.0.0_amd64.deb"])
+            apply.commit_previous(layout, built)  # committing adds to it; finishing the update prunes
+            self.assertEqual(sorted(p.name for p in layout.previous.iterdir()),
+                             ["uuway_1.0.0_amd64.deb", "uuway_1.2.0_amd64.deb"])
 
 
 class SimulationTests(unittest.TestCase):
