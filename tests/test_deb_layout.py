@@ -217,5 +217,37 @@ class MetadataTests(unittest.TestCase):
         self.assertIn("usr/share/doc/uuway/copyright", DEST.values())
 
 
+class ReleaseKeyTests(unittest.TestCase):
+    """The key that `uuway update` trusts is pinned in code and shipped as a file; they must agree."""
+
+    KEYRING = ROOT / "config/uuway-release.gpg"
+
+    def primary_fingerprints(self):
+        listing = subprocess.run(["gpg", "--show-keys", "--with-colons", str(self.KEYRING)], capture_output=True,
+                                 text=True, check=True).stdout
+        found, expect_primary = set(), False
+        for line in listing.splitlines():
+            if line.startswith("pub:"):
+                expect_primary = True
+            elif line.startswith("fpr:") and expect_primary:
+                found.add(line.split(":")[9].upper())
+                expect_primary = False
+        return found
+
+    def test_a_pinned_fingerprint_needs_the_keyring_and_the_keyring_needs_the_package_entry(self):
+        apply = load("uuway_update_apply", "scripts/uuway_update_apply.py")
+        pinned = {fingerprint.upper() for fingerprint in apply.TRUSTED_FINGERPRINTS}
+        if not self.KEYRING.exists():
+            self.assertEqual(pinned, set(), "a fingerprint is pinned but config/uuway-release.gpg is missing")
+            self.assertNotIn("config/uuway-release.gpg", DEST)
+            return
+        self.assertEqual(DEST.get("config/uuway-release.gpg"), f"{deb_manifest.LIB}/config/uuway-release.gpg",
+                         "the release keyring is in the repository but the package does not ship it")
+        self.assertEqual(f"{deb_manifest.LIB}/config/uuway-release.gpg".lstrip("/"), str(apply.KEYRING).lstrip("/"))
+        if subprocess.run(["which", "gpg"], capture_output=True).returncode == 0:
+            self.assertEqual(self.primary_fingerprints(), pinned,
+                             "the keyring file and TRUSTED_FINGERPRINTS describe different keys")
+
+
 if __name__ == "__main__":
     unittest.main()
