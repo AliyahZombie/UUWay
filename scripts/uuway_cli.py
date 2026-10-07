@@ -29,6 +29,9 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import uuway_update  # noqa: E402
+import uuway_update_apply as update_checks  # noqa: E402
+
 PYTHON = '/usr/bin/python3'
 WINE_DIR = Path('/opt/wine-stable/bin')
 WINE_SERIES = 'wine-11.0'
@@ -44,6 +47,10 @@ SHIPPED_RULE = Path('/usr/lib/udev/rules.d') / UDEV_RULE
 LEGACY_RULE = Path('/etc/udev/rules.d') / UDEV_RULE
 BRIDGE_UNIT = 'uu-native-bridge.service'
 CGROUP_FILE = Path('/proc/self/cgroup')
+DEB_ROOT = Path('/usr/lib/uuway')  # where the package puts the tree; a checkout is somewhere else
+UPDATE_STATE = Path('/var/lib/uuway/update')  # root's record of updates; world-readable
+UPDATE_UNIT = 'uuway-update'
+UPDATE_STALE_DAYS = 14
 SERVICE_MARKER = '# Managed by UURB native installer;'
 DESKTOP_MARKER = '# Managed by UUWay console installer'
 FCITX_MARKER = '# Managed by uuway setup'
@@ -88,6 +95,14 @@ class SetupError(Exception):
     """A step cannot continue; the message tells the user what to do."""
 
 
+def in_uu_terminal():
+    """True when this shell is UU's own remote terminal: its cgroup is the bridge service."""
+    try:
+        return BRIDGE_UNIT in CGROUP_FILE.read_text()
+    except OSError:
+        return False
+
+
 def remote_session():
     """True when the shell came in through UU's own terminal or SSH.
 
@@ -95,12 +110,7 @@ def remote_session():
     sitting there: a polkit dialog would open on an empty screen and the command would
     wait for ever.  UU's terminal is recognised by its cgroup, the bridge service.
     """
-    if os.environ.get('SSH_CONNECTION') or os.environ.get('SSH_TTY'):
-        return True
-    try:
-        return BRIDGE_UNIT in CGROUP_FILE.read_text()
-    except OSError:
-        return False
+    return bool(os.environ.get('SSH_CONNECTION') or os.environ.get('SSH_TTY')) or in_uu_terminal()
 
 
 class Context:
@@ -237,9 +247,13 @@ def wine_version(ctx):
     return result.stdout.strip() if result.returncode == 0 else None
 
 
-def check_environment(ctx):
+def refuse_root():
     if os.geteuid() == 0 or os.environ.get('SUDO_USER'):
         raise SetupError('请以普通用户运行，不要使用 sudo 或 root；需要权限的步骤会自己请求。')
+
+
+def check_environment(ctx):
+    refuse_root()
     release = {}
     with contextlib.suppress(OSError):
         for line in Path('/etc/os-release').read_text().splitlines():
@@ -586,6 +600,8 @@ def backup_candidates(ctx):
     app_bin = ctx.app_dir / 'bin'
     candidates = [ctx.unit_dir / (name + '.service') for name in SERVICES]
     candidates += [ctx.config_dir / name for name in BACKUP_CONFIG]
+    if ctx.config_dir.is_dir():  # a rollback has to find the old installer's whole configuration as it was
+        candidates += sorted(path for path in ctx.config_dir.rglob('*') if path not in candidates)
     candidates += [ctx.prefix / 'compat' / name for name in HELPERS]
     candidates += [app_bin / 'powershell.exe', app_bin / 'conpty.dll',
                    ctx.prefix / 'drive_c/windows/system32/WindowsPowerShell/v1.0/powershell.exe',
@@ -1121,6 +1137,8 @@ def command_doctor(args):
     if shutil.which('fcitx5') and fcitx_library().is_file():
         check('ok' if fcitx_conf_path(ctx).is_file() else 'warn', 'Fcitx5 输入法插件',
               str(fcitx_conf_path(ctx)))
+    for level, name, detail in update_notices(ctx):
+        check(level, name, detail)
     failed = [item for item in results if item['level'] == 'fail']
     if args.json:
         print(json.dumps(results, ensure_ascii=False, indent=2))
@@ -1130,6 +1148,306 @@ def command_doctor(args):
             print(f'{marks[item["level"]]} {item["name"]}' + (f'  {item["detail"]}' if item['detail'] else ''))
         print(f'\n{len(failed)} 项失败，{sum(i["level"] == "warn" for i in results)} 项警告')
     return 1 if failed else 0
+
+
+# --------------------------------------------------------------------- update
+
+def new_fetcher():
+    return uuway_update.Fetcher()
+
+
+def deb_version(ctx):
+    """The installed package's version, or None when this is not a package install."""
+    if ROOT.resolve() != DEB_ROOT:
+        return None
+    result = ctx.probe(['dpkg-query', '-W', '-f=${Version}', 'uuway'])
+    return result.stdout.strip() or None if result.returncode == 0 else None
+
+
+def is_newer(ctx, new, old):
+    try:
+        return update_checks.version_is_newer(new, old, run=lambda argv, **kwargs: ctx.probe(argv))
+    except update_checks.VerifyError as error:
+        raise SetupError(str(error))
+
+
+def update_cache(ctx):
+    """What the last `uuway update` learned, if it is well formed."""
+    cache = read_json(ctx.state_dir / 'update.json')
+    if (isinstance(cache, dict) and isinstance(cache.get('tag'), str) and update_checks.TAG.fullmatch(cache['tag'])
+            and cache.get('version') == cache['tag'][1:]):
+        return cache
+    return {}
+
+
+def latest_known(ctx):
+    """The newest published release; the answer is cached so that `doctor` can mention it offline."""
+    cache = update_cache(ctx)
+    try:
+        latest = uuway_update.latest_release(new_fetcher(), etag=cache.get('etag'))
+        if latest is None:  # nothing new since the cached answer
+            latest = uuway_update.Latest(cache['tag'], cache['version'], cache.get('published', ''),
+                                         cache.get('etag'), uuway_update.RELEASE_PAGE.format(tag=cache['tag']))
+    except uuway_update.FetchError as error:
+        raise SetupError(str(error))
+    if not ctx.dry_run:
+        record = dict(schema=1, checked_at=int(time.time()), tag=latest.tag, version=latest.version,
+                      published=latest.published, etag=latest.etag)
+        write_atomic(ctx.state_dir / 'update.json', json.dumps(record).encode(), 0o600)
+    return latest
+
+
+def update_check(ctx, args):
+    installed = deb_version(ctx)
+    latest = latest_known(ctx)
+    if installed is None:
+        info(f'最新正式版：{latest.version}（{latest.url}）')
+        warn('这不是用安装包装的 UUWay（源码目录或开发构建），没法比较版本，也不能用 uuway update 安装。')
+        return 0
+    if is_newer(ctx, latest.version, installed):
+        print(f'   {_paint("1;32", "有新版本")} {latest.version}（当前 {installed}，发布于 {latest.published[:10]}）')
+        info(f'更新说明：{latest.url}')
+        info('安装：uuway update install（安装时远程连接会断开几分钟，会自动检查并在不正常时回滚）')
+    else:
+        ok(f'已是最新（{installed}）。')
+    return 0
+
+
+def read_progress(limit=200):
+    try:
+        return (UPDATE_STATE / 'progress.log').read_text().splitlines()[-limit:]
+    except OSError:
+        return []
+
+
+def describe_result(result):
+    """Print how an update ended; returns the outcome."""
+    outcome = result.get('outcome')
+    when = time.strftime('%Y-%m-%d %H:%M', time.localtime(result.get('finished', 0)))
+    steps = f'{result.get("from_version")} → {result.get("to_version")}'
+    message = result.get('message', '')
+    if outcome == 'success':
+        ok(f'更新成功（{steps}，{when}）：{message}')
+    elif outcome == 'rolled_back':
+        warn(f'更新没有成功，已自动回滚（{steps}，{when}）：{message}')
+        info('机器已恢复；失败的原因见 journalctl -u uuway-update。重试前先看看发布说明。')
+    elif outcome == 'not_started':
+        info(f'更新没有开始，系统没有任何改变（{when}）：{message}')
+    elif outcome == 'rollback_failed':
+        warn(f'更新失败，自动回滚也没有成功（{steps}，{when}）：{message}')
+        info(f'恢复步骤：{result.get("recovery") or UPDATE_STATE / "RECOVERY.txt"}（按里面的命令一步步做）')
+    else:
+        info(f'上次更新的结果无法识别：{outcome}')
+    return outcome
+
+
+def update_status(ctx, args):
+    if ctx.probe(['systemctl', 'is-active', '--quiet', UPDATE_UNIT]).returncode == 0:
+        warn('更新正在进行中，最近的进度：')
+        for line in read_progress(12):
+            info(line)
+        return 0
+    result = read_json(UPDATE_STATE / 'last-result.json')
+    if not isinstance(result, dict):
+        info('还没有更新记录。')
+        return 0
+    return 1 if describe_result(result) == 'rollback_failed' else 0
+
+
+def update_recovery_layer(ctx, args):
+    """An update that crashes the desktop must not leave the machine at a login screen for good."""
+    timed = timed_state(ctx)
+    if timed and timed[0] and timed[1] == getpass.getuser():
+        return
+    warn('这台机器在桌面崩溃或注销后不会自动重新登录：万一更新让桌面崩溃，没有人在本机登录，UU 就一直离线。')
+    info('先开启：uuway autologin on')
+    if ctx.assume_yes or not sys.stdin.isatty():
+        raise SetupError('没有开启“崩溃后自动重新登录”，--yes 或非交互运行不会替你冒这个险。'
+                         '先运行 uuway autologin on，或在终端里交互运行并明确同意。')
+    if not input('   仍然继续？[y/N] ').lower().startswith('y'):
+        raise SetupError('已取消。')
+
+
+def health_baseline(ctx):
+    """How the machine looks before the update, as the user; the update compares against it."""
+    job = update_checks.Job(update_checks.Layout(), user=getpass.getuser(), uid=os.getuid(), home=ctx.home,
+                            prefix=ctx.prefix)
+    job.as_user = lambda argv, **kwargs: ctx.probe(argv)
+    return update_checks.snapshot_health(job)
+
+
+def check_disk_space(deb):
+    need = 4 * deb.stat().st_size + (100 << 20)  # the new package, the saved old one, their unpacking, and margin
+    for directory in (Path('/var/lib'), Path('/usr')):
+        free = shutil.disk_usage(directory).free
+        if free < need:
+            raise SetupError(f'{directory} 所在的磁盘空间不够：需要约 {need >> 20} MiB，只剩 {free >> 20} MiB。')
+
+
+def apply_command(mode, *, tag=None, stage=None, user=None, uid=None, home=None, prefix=None, snapshot='',
+                  baseline=None, reboot=False):
+    """The one command that runs as root: a systemd unit, so that it outlives this terminal.
+
+    The terminal this runs in may be UU's own, and the update restarts the service that
+    terminal belongs to.  A transient system unit is not in that service's cgroup, so it is
+    not killed with it; the inhibitor keeps the machine from sleeping or shutting down
+    underneath it.
+    """
+    script = [PYTHON, '-I', '-B', str(DEB_ROOT / 'scripts/uuway_update_apply.py'), mode]
+    if mode == 'apply':
+        script += ['--tag', tag, '--stage', str(stage), '--user', user, '--uid', str(uid), '--home', str(home),
+                   '--prefix', str(prefix), '--snapshot', str(snapshot or ''), '--baseline', str(baseline)]
+    if reboot:
+        script.append('--reboot-if-stuck')
+    return ['systemd-run', f'--unit={UPDATE_UNIT}', '--collect', '--no-ask-password', '-q',
+            '-p', 'OOMScoreAdjust=-500', '-E', 'DEBIAN_FRONTEND=noninteractive', '-E', 'NEEDRESTART_SUSPEND=1',
+            'systemd-inhibit', '--what=shutdown:sleep', '--who=uuway', '--why=UUWay update', '--mode=block', *script]
+
+
+def follow_progress(ctx, started, already, limit=1500):
+    """Show the update's progress until it ends.  The update does not depend on this process."""
+    info('更新在后台进行，这个终端断开也不会影响它；重连后运行 uuway update status 查看结果。')
+    shown = already
+    deadline = time.monotonic() + limit
+    while time.monotonic() < deadline:
+        lines = read_progress(10 ** 6)
+        for line in lines[shown:]:
+            info(line)
+        shown = len(lines)
+        result = read_json(UPDATE_STATE / 'last-result.json')
+        if isinstance(result, dict) and result.get('finished', 0) >= started:
+            return 0 if describe_result(result) == 'success' else 1
+        time.sleep(2)
+    warn('等了很久还没有结束；运行 uuway update status 查看。')
+    return 0
+
+
+def launch_update(ctx, command):
+    started = time.time()
+    already = len(read_progress(10 ** 6))
+    ctx.run(ctx.elevate(command, terminal_first=True))
+    return follow_progress(ctx, started, already)
+
+
+def announce_outage(ctx, args, what):
+    if in_uu_terminal():
+        warn(f'你正在 UU 的远程终端里：{what}时这个连接会断开，通常 2～5 分钟内恢复。'
+             '更新在后台继续，不受断线影响；重连后运行 uuway update status 看结果。')
+    else:
+        info(f'{what}时远程连接会断开几分钟。')
+    if args.reboot_if_stuck:
+        warn('已加 --reboot-if-stuck：回滚后桌面仍然回不来时，会自动重启这台机器一次（正在跑的任务会中断）。')
+
+
+def confirm_default_no(ctx, question):
+    if ctx.assume_yes:
+        return True
+    if not sys.stdin.isatty():
+        raise SetupError('需要你确认，但这里不是交互终端；在终端里运行，或加 --yes。')
+    return input(f'   {question} [y/N] ').lower().startswith('y')
+
+
+def update_install(ctx, args):
+    installed = deb_version(ctx)
+    if installed is None:
+        raise SetupError('uuway update install 只支持用安装包（.deb）装的 UUWay；源码目录请自己更新。')
+    if installed.startswith('0.0.0~'):
+        raise SetupError(f'这是开发构建（{installed}），不能用 OTA 更新。')
+    if ctx.probe(['systemctl', 'is-active', '--quiet', UPDATE_UNIT]).returncode == 0:
+        raise SetupError('已经有一个更新在进行；运行 uuway update status 查看。')
+    audit = ctx.probe(['dpkg', '--audit'])
+    if audit.returncode != 0 or audit.stdout.strip():
+        raise SetupError('dpkg 处于未完成状态，先修好它：sudo dpkg --configure -a')
+    latest = latest_known(ctx)
+    if not is_newer(ctx, latest.version, installed):
+        ok(f'已是最新（{installed}）。')
+        return 0
+    tag, version = latest.tag, latest.version
+    stage = ctx.state_dir / 'update' / version
+    baseline_file = stage / 'baseline.json'
+    command = apply_command('apply', tag=tag, stage=stage, user=getpass.getuser(), uid=os.getuid(), home=ctx.home,
+                            prefix=ctx.prefix, snapshot='<更新前快照>', baseline=baseline_file, reboot=args.reboot_if_stuck)
+    if ctx.dry_run:
+        info(f'（演练）会把 {installed} 更新到 {version}：下载并校验签名，备份，然后以 root 运行：')
+        print('   ' + _paint('2', '$ ' + ' '.join(ctx.elevate(command, terminal_first=True))))
+        return 0
+    update_recovery_layer(ctx, args)
+    baseline = health_baseline(ctx)
+    problems = update_checks.baseline_problems(baseline)
+    if problems:
+        raise SetupError('机器现在就不太正常，不适合更新：' + '、'.join(problems) + '。先运行 uuway doctor。')
+    shutil.rmtree(ctx.state_dir / 'update', ignore_errors=True)
+    try:
+        uuway_update.download_release(new_fetcher(), tag, stage)
+        release = update_checks.check_release(stage, tag, installed, update_checks.KEYRING,
+                                              update_checks.TRUSTED_FINGERPRINTS, run=subprocess.run)
+    except uuway_update.Unsigned as error:
+        raise SetupError(str(error))
+    except (uuway_update.FetchError, update_checks.VerifyError) as error:
+        raise SetupError(str(error))
+    ok(f'已下载并校验 {version}（签名和哈希都对得上）。')
+    check_disk_space(release.deb)
+    write_atomic(baseline_file, json.dumps(baseline).encode(), 0o600)
+    snapshot = ensure_backup(ctx)
+    command = apply_command('apply', tag=tag, stage=stage, user=getpass.getuser(), uid=os.getuid(), home=ctx.home,
+                            prefix=ctx.prefix, snapshot=snapshot or '', baseline=baseline_file,
+                            reboot=args.reboot_if_stuck)
+    print(f'\n将把 UUWay 从 {installed} 更新到 {version}。')
+    info('过程：备份当前版本 → 安装 → 重启桥接服务 → 观察约 90 秒 → 不正常就自动回滚。')
+    announce_outage(ctx, args, '安装')
+    if not confirm_default_no(ctx, '现在更新？'):
+        info('已取消，什么都没有改。')
+        return 1
+    return launch_update(ctx, command)
+
+
+def update_rollback(ctx, args):
+    result = read_json(UPDATE_STATE / 'last-result.json')
+    previous = Path(result.get('previous_deb') or '/nonexistent') if isinstance(result, dict) else None
+    if previous is None or not previous.is_file():
+        raise SetupError('没有可以回到的旧版本（还没有用 uuway update 更新过，或者备份已被清掉）。')
+    if ctx.probe(['systemctl', 'is-active', '--quiet', UPDATE_UNIT]).returncode == 0:
+        raise SetupError('已经有一个更新在进行；运行 uuway update status 查看。')
+    print(f'\n将回到更新前的版本 {result.get("from_version")}（现在是 {deb_version(ctx) or "未知"}）。')
+    if ctx.dry_run:
+        info('（演练）会以 root 运行：')
+        print('   ' + _paint('2', '$ ' + ' '.join(ctx.elevate(apply_command('rollback', reboot=args.reboot_if_stuck),
+                                                             terminal_first=True))))
+        return 0
+    update_recovery_layer(ctx, args)
+    announce_outage(ctx, args, '回滚')
+    if not confirm_default_no(ctx, '现在回滚？'):
+        info('已取消，什么都没有改。')
+        return 1
+    return launch_update(ctx, apply_command('rollback', reboot=args.reboot_if_stuck))
+
+
+def command_update(args):
+    ctx = Context(args)
+    refuse_root()
+    handler = dict(check=update_check, install=update_install, status=update_status, rollback=update_rollback)
+    return handler[args.action](ctx, args)
+
+
+def update_notices(ctx):
+    """What `doctor` says about updates, from what is already on disk: it never goes online."""
+    notices = []
+    installed = deb_version(ctx)
+    cache = update_cache(ctx)
+    if installed and cache:
+        with contextlib.suppress(SetupError):
+            if is_newer(ctx, cache['version'], installed):
+                checked = time.strftime('%Y-%m-%d', time.localtime(cache.get('checked_at', 0)))
+                notices.append(('warn', f'有新版本 {cache["version"]}', f'运行 uuway update 查看（上次检查：{checked}）'))
+    result = read_json(UPDATE_STATE / 'last-result.json')
+    if isinstance(result, dict) and result.get('outcome') in ('rolled_back', 'rollback_failed'):
+        if time.time() - result.get('finished', 0) < UPDATE_STALE_DAYS * 86400:
+            if result['outcome'] == 'rolled_back':
+                notices.append(('warn', '上次更新没有成功，已自动回滚', f'{result.get("message", "")}；详情：uuway update status'))
+            else:
+                notices.append(('warn', '上次更新失败，自动回滚也没有成功',
+                                f'按 {result.get("recovery") or UPDATE_STATE / "RECOVERY.txt"} 里的步骤恢复'))
+    return notices
 
 
 # --------------------------------------------------------------------- uninstall
@@ -1211,6 +1529,15 @@ def build_parser():
     common(autologin)
     autologin.add_argument('action', choices=('on', 'off', 'status'))
     autologin.set_defaults(handler=command_autologin)
+
+    update = commands.add_parser('update', help='检查并安装 UUWay 的新版本（校验签名，不正常会自动回滚）')
+    common(update)
+    update.add_argument('action', nargs='?', choices=('check', 'install', 'status', 'rollback'), default='check',
+                        help='check 查看有没有新版本（默认）；install 安装；status 看上次更新的结果；rollback 回到更新前的版本')
+    update.add_argument('--prefix', type=Path)
+    update.add_argument('--reboot-if-stuck', action='store_true',
+                        help='回滚后桌面仍然回不来时，自动重启这台机器一次（会中断正在跑的任务）')
+    update.set_defaults(handler=command_update)
 
     uninstall = commands.add_parser('uninstall', help='删除用户级服务与菜单入口')
     common(uninstall)

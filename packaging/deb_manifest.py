@@ -37,6 +37,8 @@ RUNTIME_SCRIPTS = (
     'uu-native-trial.py',
     'uuway_cli.py',
     'uuway_console.py',
+    'uuway_update.py',
+    'uuway_update_apply.py',
 )
 
 SYSTEMD_TEMPLATES = (

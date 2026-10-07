@@ -9,6 +9,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -614,6 +615,545 @@ class ElevationTests(CliCase):
             self.assertIn("授权窗口", self.context().elevation_hint())
         with patch.object(cli.Context, "elevate", return_value=["sudo"]):
             self.assertIn("sudo 密码", self.context().elevation_hint())
+
+
+ORIGINAL_FOLLOW = cli.follow_progress  # the real one; UpdateCase replaces it for the other tests
+
+
+class FakeUpdateFetcher:
+    """GitHub, as far as `uuway update` can tell."""
+
+    def __init__(self):
+        self.calls = []
+        self.tag = "v1.2.1"
+        self.etag = '"e1"'
+        self.unsigned = False
+        self.not_modified = False
+        self.failure = None
+
+    def get(self, url, limit, headers=None):
+        self.calls.append(("get", url, dict(headers or {})))
+        if self.failure:
+            raise self.failure
+        if self.not_modified and (headers or {}).get("If-None-Match"):
+            raise cli.uuway_update.NotModified()
+        body = json.dumps(dict(tag_name=self.tag, draft=False, prerelease=False,
+                               published_at="2026-10-08T01:02:03Z")).encode()
+        return body, {"etag": self.etag}
+
+    def save(self, url, path, limit):
+        self.calls.append(("save", url, limit))
+        name = url.rsplit("/", 1)[1]
+        if name == "SHA256SUMS.asc" and self.unsigned:
+            raise cli.uuway_update.NotFound("x")
+        Path(path).write_bytes(b"deb" * 1000 if name.endswith(".deb") else b"x" * 10)
+
+
+def dotted(version):
+    return tuple(int(part) for part in version.split("."))
+
+
+class UpdateCase(CliCase):
+    HEALTHY = dict(units={name: dict(active=True, restarts=0, entered=1) for name in ("uu-native-display",
+                   "uu-native-text", "uu-native-bridge")}, processes={"GameViewerServer.exe": 1}, connected=True)
+
+    def setUp(self):
+        super().setUp()
+        self.state = self.root / "varstate"
+        self.state.mkdir()
+        self.cgroup = self.root / "cgroup"
+        self.cgroup.write_text("0::/user.slice/user-1000.slice/app.slice/app-gnome-terminal.scope\n")
+        self.fetcher = FakeUpdateFetcher()
+        self.installed = "1.2.0"
+        self.update_running = False
+        self.audit = ""
+        self.recovery_layer = True
+        self.progress = []
+        self.baseline = dict(self.HEALTHY)
+
+        def check_release(stage, tag, installed, keyring, fingerprints, *, run):
+            self.checked = (tag, installed)
+            deb = Path(stage) / f"uuway_{tag[1:]}_amd64.deb"
+            return cli.update_checks.Release(tag[1:], deb, "0" * 64)
+        self.checked = None
+        for override in (patch.object(cli, "DEB_ROOT", self.checkout.resolve()),
+                         patch.object(cli, "UPDATE_STATE", self.state),
+                         patch.object(cli, "CGROUP_FILE", self.cgroup),
+                         patch.object(cli, "new_fetcher", lambda: self.fetcher),
+                         patch.object(cli, "health_baseline", lambda ctx: self.baseline),
+                         patch.object(cli, "timed_state", lambda ctx: (self.recovery_layer, cli.getpass.getuser())),
+                         patch.object(cli, "follow_progress", self.follow),
+                         patch.object(cli.update_checks, "check_release", check_release)):
+            override.start()
+            self.addCleanup(override.stop)
+
+    def follow(self, ctx, started, already, limit=0):
+        self.followed = True
+        return 0
+
+    def update_context(self, action="install", yes=True, dry_run=False, reboot=False):
+        args = Namespace(dry_run=dry_run, yes=yes, prefix=self.prefix, action=action, reboot_if_stuck=reboot)
+        ctx = cli.Context(args)
+        self.commands = []
+        self.followed = False
+
+        def run(argv, **kwargs):
+            self.commands.append([str(part) for part in argv])
+            return completed(argv)
+
+        def probe(argv, **kwargs):
+            argv = [str(part) for part in argv]
+            if argv[:2] == ["dpkg-query", "-W"]:
+                return completed(argv, 0 if self.installed else 1, self.installed or "")
+            if argv[:2] == ["dpkg", "--compare-versions"]:
+                return completed(argv, 0 if dotted(argv[2]) > dotted(argv[4]) else 1)
+            if argv[:3] == ["systemctl", "is-active", "--quiet"]:
+                return completed(argv, 0 if self.update_running else 3)
+            if argv[:2] == ["dpkg", "--audit"]:
+                return completed(argv, 0, self.audit)
+            return completed(argv, 127)
+        ctx.run, ctx.probe = run, probe
+        return ctx, args
+
+    def install(self, **options):
+        ctx, args = self.update_context(**options)
+        with patch.object(cli.sys.stdin, "isatty", return_value=True):
+            return ctx, args, self.quiet(cli.update_install, ctx, args)
+
+    def launched(self):
+        return [argv for argv in self.commands if "systemd-run" in argv]
+
+
+class UpdateCheckTests(UpdateCase):
+    def check(self):
+        ctx, args = self.update_context("check")
+        return ctx, self.quiet(cli.update_check, ctx, args)
+
+    def test_a_newer_release_is_announced_with_how_to_install_it(self):
+        ctx, (code, output) = self.check()
+        self.assertEqual(code, 0)
+        self.assertIn("有新版本", output)
+        self.assertIn("1.2.1", output)
+        self.assertIn("uuway update install", output)
+        self.assertEqual(self.commands, [])  # a check never touches the system
+
+    def test_the_answer_is_cached_privately_for_doctor(self):
+        ctx, _ = self.check()
+        cache = ctx.state_dir / "update.json"
+        self.assertEqual(json.loads(cache.read_text())["version"], "1.2.1")
+        self.assertEqual(cache.stat().st_mode & 0o777, 0o600)
+
+    def test_no_newer_release_is_said_plainly(self):
+        self.fetcher.tag = "v1.2.0"
+        _, (code, output) = self.check()
+        self.assertIn("已是最新", output)
+        self.assertNotIn("uuway update install", output)
+
+    def test_a_second_check_sends_the_etag_and_a_304_uses_the_cache(self):
+        self.check()
+        self.fetcher.not_modified = True
+        _, (code, output) = self.check()
+        self.assertEqual(self.fetcher.calls[-1][2], {"If-None-Match": '"e1"'})
+        self.assertIn("有新版本", output)
+
+    def test_a_source_checkout_cannot_compare_versions_and_says_so(self):
+        self.installed = None
+        _, (code, output) = self.check()
+        self.assertEqual(code, 0)
+        self.assertIn("1.2.1", output)
+        self.assertIn("不是用安装包装的", output)
+
+    def test_a_network_failure_is_an_error_with_a_reason(self):
+        self.fetcher.failure = cli.uuway_update.FetchError("无法连接 GitHub：no route")
+        ctx, args = self.update_context("check")
+        with self.assertRaisesRegex(cli.SetupError, "无法连接 GitHub"):
+            self.quiet(cli.update_check, ctx, args)
+
+    def test_a_tampered_cache_is_ignored(self):
+        ctx, _ = self.check()
+        (ctx.state_dir / "update.json").write_text(json.dumps(dict(tag="v9.9.9", version="1.0.0", etag='"x"')))
+        self.check()
+        self.assertEqual(self.fetcher.calls[-1][2], {})  # no etag was trusted from it
+
+
+class UpdateRefusalTests(UpdateCase):
+    def refused(self, pattern, **options):
+        ctx, args = self.update_context(**options)
+        with patch.object(cli.sys.stdin, "isatty", return_value=True), \
+                self.assertRaisesRegex(cli.SetupError, pattern):
+            self.quiet(cli.update_install, ctx, args)
+        self.assertEqual(self.launched(), [])
+        return ctx
+
+    def test_only_a_package_install_can_be_updated(self):
+        self.installed = None
+        self.refused("只支持用安装包")
+
+    def test_a_development_build_cannot(self):
+        self.installed = "0.0.0~git1234567"
+        self.refused("开发构建")
+
+    def test_a_running_update_blocks_another(self):
+        self.update_running = True
+        self.refused("已经有一个更新在进行")
+
+    def test_a_broken_dpkg_state_blocks_it(self):
+        self.audit = "The following packages are only half configured:\n uuway\n"
+        self.refused("dpkg 处于未完成状态")
+
+    def test_an_unhealthy_machine_is_not_updated(self):
+        self.baseline = dict(units={**self.HEALTHY["units"], "uu-native-bridge": dict(active=False, restarts=0, entered=1)},
+                             processes={"GameViewerServer.exe": 0}, connected=None)
+        ctx = self.refused("不太正常")
+        self.assertFalse((ctx.state_dir / "update").exists())  # not even downloaded
+
+    def test_nothing_newer_means_nothing_to_do(self):
+        self.fetcher.tag = "v1.2.0"
+        ctx, args, (code, output) = self.install()
+        self.assertEqual(code, 0)
+        self.assertIn("已是最新", output)
+        self.assertEqual(self.launched(), [])
+        self.assertFalse([call for call in self.fetcher.calls if call[0] == "save"])
+
+    def test_an_unsigned_release_is_reported_and_nothing_is_elevated(self):
+        self.fetcher.unsigned = True
+        self.refused("还没有签名")
+
+    def test_a_release_that_fails_verification_is_not_installed(self):
+        def refuse(*args, **kwargs):
+            raise cli.update_checks.VerifyError("签名校验失败（BADSIG）。")
+        with patch.object(cli.update_checks, "check_release", refuse):
+            self.refused("BADSIG")
+
+    def test_a_download_failure_is_reported(self):
+        def broken(url, path, limit):
+            raise cli.uuway_update.FetchError("下载超时，已放弃。")
+        self.fetcher.save = broken
+        self.refused("下载超时")
+
+    def test_too_little_disk_space_stops_it_before_anything_is_installed(self):
+        usage = lambda path: Namespace(free=1 << 20)
+        with patch.object(cli.shutil, "disk_usage", usage):
+            self.refused("磁盘空间不够")
+
+    def test_a_non_interactive_run_without_yes_cannot_confirm(self):
+        ctx, args = self.update_context(yes=False)
+        with patch.object(cli.sys.stdin, "isatty", return_value=False), \
+                self.assertRaisesRegex(cli.SetupError, "不是交互终端"):
+            self.quiet(cli.update_install, ctx, args)
+        self.assertEqual(self.launched(), [])
+
+    def test_declining_the_confirmation_changes_nothing(self):
+        ctx, args = self.update_context(yes=False)
+        with patch.object(cli.sys.stdin, "isatty", return_value=True), patch("builtins.input", return_value=""):
+            code, output = self.quiet(cli.update_install, ctx, args)
+        self.assertEqual(code, 1)
+        self.assertIn("已取消", output)
+        self.assertEqual(self.launched(), [])
+
+
+class HealthBaselineTests(CliCase):
+    def test_the_baseline_is_read_as_the_user_through_the_probe(self):
+        asked = []
+        blocks = "\n".join(f"NRestarts=1\nId={name}.service\nActiveState=active\nSubState=running\n"
+                           "ActiveEnterTimestampMonotonic=77\n" for name in cli.SERVICES)
+
+        def probe(argv, **kwargs):
+            asked.append([str(part) for part in argv])
+            return completed(argv, 0, blocks)
+        ctx = self.context()
+        ctx.probe = probe
+        with patch.object(cli.update_checks, "count_uu_processes", return_value={"GameViewerServer.exe": 1}) as count, \
+                patch.object(cli.update_checks, "uu_connected", return_value=True) as connected:
+            baseline = cli.health_baseline(ctx)
+        self.assertEqual(asked[0][:3], ["systemctl", "--user", "show"])  # no runuser: this already is the user
+        self.assertNotIn("runuser", asked[0])
+        self.assertEqual(count.call_args[0][1], os.getuid())
+        self.assertEqual(connected.call_args[0][1], os.getuid())
+        self.assertTrue(all(unit["active"] and unit["restarts"] == 1 for unit in baseline["units"].values()))
+        self.assertEqual((baseline["processes"], baseline["connected"]), ({"GameViewerServer.exe": 1}, True))
+        self.assertEqual(cli.update_checks.baseline_problems(baseline), [])
+
+
+class UpdateRecoveryLayerTests(UpdateCase):
+    """An update that crashes the desktop must not strand a machine at its login screen."""
+
+    def test_without_the_recovery_layer_yes_alone_refuses(self):
+        self.recovery_layer = False
+        ctx, args = self.update_context(yes=True)
+        with patch.object(cli.sys.stdin, "isatty", return_value=True), \
+                self.assertRaisesRegex(cli.SetupError, "--yes 或非交互运行不会替你冒这个险"):
+            self.quiet(cli.update_install, ctx, args)
+        self.assertEqual(self.launched(), [])
+
+    def test_interactively_it_can_be_accepted_knowingly(self):
+        self.recovery_layer = False
+        ctx, args = self.update_context(yes=False)
+        answers = iter(["y", "y"])  # carry on despite the warning; then confirm the update
+        with patch.object(cli.sys.stdin, "isatty", return_value=True), \
+                patch("builtins.input", side_effect=lambda prompt: next(answers)):
+            code, output = self.quiet(cli.update_install, ctx, args)
+        self.assertIn("uuway autologin on", output)
+        self.assertEqual(len(self.launched()), 1)
+
+    def test_interactively_it_can_be_declined(self):
+        self.recovery_layer = False
+        ctx, args = self.update_context(yes=False)
+        with patch.object(cli.sys.stdin, "isatty", return_value=True), patch("builtins.input", return_value="n"), \
+                self.assertRaisesRegex(cli.SetupError, "已取消"):
+            self.quiet(cli.update_install, ctx, args)
+        self.assertEqual(self.launched(), [])
+
+
+class UpdateLaunchTests(UpdateCase):
+    def test_the_one_root_command_is_a_detached_unit_with_everything_it_needs(self):
+        with patch.dict(os.environ, {"WAYLAND_DISPLAY": "wayland-0"}), \
+                patch.object(cli.shutil, "which", return_value="/usr/bin/pkexec"):
+            ctx, args, (code, output) = self.install(reboot=True)
+        self.assertEqual(code, 0)
+        (command,) = self.launched()
+        self.assertEqual(command[0], "sudo")  # someone can type here, so ask here, not on an empty desktop
+        unit = command[command.index("systemd-run"):]
+        self.assertIn("--unit=uuway-update", unit)
+        self.assertIn("--collect", unit)
+        self.assertNotIn("--pipe", unit)   # these would tie it to this terminal
+        self.assertNotIn("--wait", unit)
+        self.assertEqual(unit[unit.index("-E") + 1], "DEBIAN_FRONTEND=noninteractive")
+        self.assertIn("NEEDRESTART_SUSPEND=1", unit)
+        self.assertIn("--what=shutdown:sleep", unit)
+        self.assertIn("--mode=block", unit)
+        script = unit[unit.index("/usr/bin/python3"):]
+        self.assertEqual(script[:4], ["/usr/bin/python3", "-I", "-B", str(self.checkout.resolve() / "scripts/uuway_update_apply.py")])
+        arguments = dict(zip(script[5::2], script[6::2]))
+        self.assertEqual(script[4], "apply")
+        self.assertEqual(arguments["--tag"], "v1.2.1")
+        self.assertEqual(arguments["--user"], cli.getpass.getuser())
+        self.assertEqual(arguments["--uid"], str(os.getuid()))
+        self.assertEqual(arguments["--home"], str(self.home))
+        self.assertEqual(arguments["--prefix"], str(self.prefix))
+        self.assertIn("--reboot-if-stuck", script)
+        stage = Path(arguments["--stage"])
+        self.assertEqual(stage, ctx.state_dir / "update/1.2.1")
+        self.assertEqual(sorted(path.name for path in stage.iterdir()),
+                         ["SHA256SUMS", "SHA256SUMS.asc", "baseline.json", "uuway_1.2.1_amd64.deb"])
+        baseline = json.loads((stage / "baseline.json").read_text())
+        self.assertEqual(baseline["processes"], {"GameViewerServer.exe": 1})
+        self.assertEqual(Path(arguments["--baseline"]), stage / "baseline.json")
+        self.assertEqual((stage / "baseline.json").stat().st_mode & 0o777, 0o600)
+        self.assertTrue(self.followed)
+
+    def test_the_cli_itself_never_installs_anything(self):
+        self.install()
+        for argv in self.commands:
+            self.assertNotIn(argv[-1][-4:], (".deb",), argv)
+            self.assertNotIn("apt-get", argv)
+            self.assertNotIn("dpkg", argv)
+
+    def test_no_reboot_flag_by_default(self):
+        self.install()
+        self.assertNotIn("--reboot-if-stuck", self.launched()[0])
+
+    def test_the_user_files_are_snapshotted_before_the_launch(self):
+        self.stage_snapshot_inputs()
+        ctx, args, _ = self.install()
+        backups = sorted(ctx.state_dir.glob("backup-*"))
+        self.assertEqual(len(backups), 1)
+        script = self.launched()[0]
+        self.assertEqual(script[script.index("--snapshot") + 1], str(backups[0]))
+        self.assertTrue((backups[0] / "home/.config/uurb/native-runtime.json").is_file())
+        self.assertTrue((backups[0] / "home/.config/uurb/extra-setting.json").is_file())  # the whole config directory
+
+    def stage_snapshot_inputs(self):
+        config = self.home / ".config/uurb"
+        config.mkdir(parents=True)
+        (config / "native-runtime.json").write_text("{}")
+        (config / "extra-setting.json").write_text("{}")
+
+    def test_the_prompt_says_how_the_connection_will_behave(self):
+        _, _, (code, output) = self.install()
+        self.assertIn("远程连接会断开", output)
+        self.assertNotIn("UU 的远程终端里", output)
+
+    def test_inside_the_uu_terminal_the_warning_is_stronger(self):
+        self.cgroup.write_text("0::/user.slice/user-1000.slice/user@1000.service/app.slice/uu-native-bridge.service\n")
+        _, _, (code, output) = self.install()
+        self.assertIn("你正在 UU 的远程终端里", output)
+        self.assertIn("uuway update status", output)
+
+    def test_the_reboot_flag_is_announced(self):
+        _, _, (code, output) = self.install(reboot=True)
+        self.assertIn("重启这台机器一次", output)
+
+    def test_dry_run_downloads_and_changes_nothing_and_shows_the_command(self):
+        ctx, args = self.update_context(dry_run=True)
+        before = sorted(path for path in self.home.rglob("*"))
+        with patch.object(cli.sys.stdin, "isatty", return_value=True):
+            code, output = self.quiet(cli.update_install, ctx, args)
+        self.assertEqual(code, 0)
+        self.assertIn("systemd-run", output)
+        self.assertIn("uuway_update_apply.py", output)
+        self.assertEqual(self.commands, [])
+        self.assertEqual(sorted(self.home.rglob("*")), before)
+        self.assertFalse([call for call in self.fetcher.calls if call[0] == "save"])
+
+    def test_the_progress_is_followed_after_the_launch(self):
+        self.install()
+        self.assertTrue(self.followed)
+
+
+class UpdateFollowTests(UpdateCase):
+    def test_the_progress_lines_are_shown_until_the_result_arrives(self):
+        ctx, _ = self.update_context()
+        (self.state / "progress.log").write_text("10:00:00 older update\n")
+        started = time.time()
+        sleeps = []
+
+        def sleep(seconds):
+            sleeps.append(seconds)
+            if len(sleeps) == 1:
+                (self.state / "progress.log").write_text("10:00:00 older update\n10:05:00 开始更新\n10:06:00 结果\n")
+                cli.write_atomic(self.state / "last-result.json", json.dumps(
+                    dict(outcome="success", message="好了", finished=started + 5, from_version="1.2.0",
+                         to_version="1.2.1")).encode(), 0o644)
+        with patch.object(cli.time, "sleep", sleep):
+            code, output = self.quiet(ORIGINAL_FOLLOW, ctx, started, 1)
+        self.assertEqual(code, 0)
+        self.assertIn("开始更新", output)
+        self.assertNotIn("older update", output)  # only what this update wrote
+        self.assertIn("更新成功", output)
+
+    def test_a_failed_update_makes_the_command_fail(self):
+        ctx, _ = self.update_context()
+        started = time.time()
+        cli.write_atomic(self.state / "last-result.json", json.dumps(
+            dict(outcome="rolled_back", message="不正常", finished=started + 1, from_version="1.2.0",
+                 to_version="1.2.1")).encode(), 0o644)
+        code, output = self.quiet(ORIGINAL_FOLLOW, ctx, started, 0)
+        self.assertEqual(code, 1)
+        self.assertIn("已自动回滚", output)
+
+
+class UpdateStatusTests(UpdateCase):
+    def result(self, **fields):
+        data = dict(outcome="success", message="m", finished=time.time(), from_version="1.2.0", to_version="1.2.1")
+        data.update(fields)
+        cli.write_atomic(self.state / "last-result.json", json.dumps(data).encode(), 0o644)
+
+    def status(self):
+        ctx, args = self.update_context("status")
+        return self.quiet(cli.update_status, ctx, args)
+
+    def test_no_record(self):
+        code, output = self.status()
+        self.assertEqual(code, 0)
+        self.assertIn("还没有更新记录", output)
+
+    def test_each_outcome_is_described(self):
+        for outcome, words, code in (("success", "更新成功", 0), ("rolled_back", "已自动回滚", 0),
+                                     ("not_started", "系统没有任何改变", 0), ("rollback_failed", "回滚也没有成功", 1)):
+            self.result(outcome=outcome)
+            status, output = self.status()
+            self.assertEqual(status, code, outcome)
+            self.assertIn(words, output, outcome)
+
+    def test_a_failed_rollback_points_at_the_recovery_steps(self):
+        self.result(outcome="rollback_failed", recovery=str(self.state / "RECOVERY.txt"))
+        _, output = self.status()
+        self.assertIn("RECOVERY.txt", output)
+
+    def test_a_running_update_shows_its_latest_progress(self):
+        self.update_running = True
+        (self.state / "progress.log").write_text("".join(f"10:00:{i:02d} 步骤 {i}\n" for i in range(30)))
+        code, output = self.status()
+        self.assertEqual(code, 0)
+        self.assertIn("更新正在进行中", output)
+        self.assertIn("步骤 29", output)
+        self.assertNotIn("步骤 5\n", output)
+
+    def test_a_garbled_result_file_is_not_a_crash(self):
+        (self.state / "last-result.json").write_text("not json")
+        code, output = self.status()
+        self.assertEqual(code, 0)
+
+
+class UpdateRollbackCommandTests(UpdateCase):
+    def test_without_a_saved_old_version_there_is_nothing_to_go_back_to(self):
+        ctx, args = self.update_context("rollback")
+        with self.assertRaisesRegex(cli.SetupError, "没有可以回到的旧版本"):
+            self.quiet(cli.update_rollback, ctx, args)
+
+    def test_rollback_launches_the_same_kind_of_detached_unit(self):
+        previous = self.state / "previous/uuway_1.2.0_amd64.deb"
+        previous.parent.mkdir()
+        previous.write_bytes(b"x")
+        cli.write_atomic(self.state / "last-result.json", json.dumps(
+            dict(outcome="success", previous_deb=str(previous), from_version="1.2.0", to_version="1.2.1",
+                 finished=time.time())).encode(), 0o644)
+        ctx, args = self.update_context("rollback")
+        with patch.object(cli.sys.stdin, "isatty", return_value=True):
+            code, output = self.quiet(cli.update_rollback, ctx, args)
+        (command,) = self.launched()
+        self.assertEqual(command[-1], "rollback")
+        self.assertIn("--unit=uuway-update", command)
+        self.assertIn("1.2.0", output)
+
+
+class UpdateDoctorTests(UpdateCase):
+    def doctor(self):
+        args = Namespace(prefix=self.prefix, json=True)
+        with patch.object(cli.Context, "probe", lambda self_, argv, **kw: self.update_context()[0].probe(argv)):
+            _, output = self.quiet(cli.command_doctor, args)
+        return {item["name"]: item for item in json.loads(output)}
+
+    def test_a_cached_newer_release_is_mentioned_without_going_online(self):
+        ctx, _ = self.update_context()
+        cli.write_atomic(ctx.state_dir / "update.json", json.dumps(
+            dict(tag="v1.2.1", version="1.2.1", checked_at=time.time(), etag='"e"')).encode(), 0o600)
+        found = self.doctor()
+        self.assertEqual(found["有新版本 1.2.1"]["level"], "warn")
+        self.assertIn("uuway update", found["有新版本 1.2.1"]["detail"])
+        self.assertEqual(self.fetcher.calls, [])  # doctor stays offline
+
+    def test_a_cached_release_that_is_not_newer_is_not_mentioned(self):
+        ctx, _ = self.update_context()
+        cli.write_atomic(ctx.state_dir / "update.json", json.dumps(
+            dict(tag="v1.2.0", version="1.2.0", checked_at=time.time())).encode(), 0o600)
+        self.assertFalse([name for name in self.doctor() if name.startswith("有新版本")])
+
+    def test_a_recent_rollback_is_mentioned_and_an_old_one_is_not(self):
+        cli.write_atomic(self.state / "last-result.json", json.dumps(
+            dict(outcome="rolled_back", message="不正常", finished=time.time() - 86400)).encode(), 0o644)
+        self.assertIn("上次更新没有成功，已自动回滚", self.doctor())
+        cli.write_atomic(self.state / "last-result.json", json.dumps(
+            dict(outcome="rolled_back", message="不正常", finished=time.time() - 30 * 86400)).encode(), 0o644)
+        self.assertNotIn("上次更新没有成功，已自动回滚", self.doctor())
+
+    def test_a_failed_rollback_points_at_the_recovery_file(self):
+        cli.write_atomic(self.state / "last-result.json", json.dumps(
+            dict(outcome="rollback_failed", finished=time.time(), recovery=str(self.state / "RECOVERY.txt"))).encode(), 0o644)
+        found = self.doctor()
+        self.assertIn("RECOVERY.txt", found["上次更新失败，自动回滚也没有成功"]["detail"])
+
+    def test_a_successful_update_is_not_a_warning(self):
+        cli.write_atomic(self.state / "last-result.json", json.dumps(
+            dict(outcome="success", finished=time.time())).encode(), 0o644)
+        self.assertFalse([name for name in self.doctor() if "上次更新" in name])
+
+
+class UpdateParserTests(unittest.TestCase):
+    def test_check_is_the_default_and_the_actions_exist(self):
+        parser = cli.build_parser()
+        self.assertEqual(parser.parse_args(["update"]).action, "check")
+        for action in ("check", "install", "status", "rollback"):
+            args = parser.parse_args(["update", action])
+            self.assertTrue(callable(args.handler))
+            self.assertEqual(args.action, action)
+        self.assertTrue(parser.parse_args(["update", "install", "--reboot-if-stuck"]).reboot_if_stuck)
+        self.assertFalse(parser.parse_args(["update", "install"]).reboot_if_stuck)
+
+    def test_root_is_refused(self):
+        with patch.object(cli.os, "geteuid", return_value=0), self.assertRaisesRegex(cli.SetupError, "普通用户"):
+            cli.command_update(cli.build_parser().parse_args(["update"]))
 
 
 class DryRunTests(CliCase):
