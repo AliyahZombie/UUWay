@@ -69,12 +69,21 @@ be: CI builds and drafts the release, the maintainer signs the draft, then publi
 
    It downloads the deb and `SHA256SUMS` from the draft and refuses to go on if they do not
    match each other (something changed after CI built them). It then signs a `SHA256SUMS`
-   that it builds itself from the deb, verifies the result with the code the clients run
-   against the key committed to the repository, and only then uploads `SHA256SUMS.asc`.
+   that it builds itself from the deb and verifies that with the code the clients run, against
+   the key committed to the repository. Only then does it upload the signed `SHA256SUMS`
+   **and** `SHA256SUMS.asc` (clients fetch the release's own `SHA256SUMS`, so the signature
+   has to be over the bytes that are really there), and finally it downloads them again and
+   verifies what the release now carries. It prints the line that publishes only if that
+   passes.
 4. Publish: `gh release edit vX.Y.Z --draft=false --latest`.
 
 A release that is published but not yet signed is reported by `uuway update` as "not
 installable yet"; it is never installed. Sign before publishing.
+
+The release workflow refuses a tagged build when the key is not in place (`packaging/check-release-key.py`:
+the keyring is in the repository, `TRUSTED_FINGERPRINTS` is the keyring's, and the package ships it).
+A release without the key would carry an updater that refuses everything, and a new key can reach
+machines only through a release signed with the old one.
 
 ## Checking a download by hand
 
@@ -119,6 +128,10 @@ to be updated by hand with `sudo apt install ./uuway_*.deb`.
 
 `gpgv` ships with every Ubuntu (apt itself needs it), so nothing extra is installed. It is run
 with an empty home directory and a single keyring, so keys in the user's own GnuPG setup count
-for nothing, and the verdict is read from its status lines: a valid signature from a pinned
-primary key, a strong hash, and none of `BADSIG`, `ERRSIG`, `EXPKEYSIG`, `REVKEYSIG`,
-`EXPSIG` or `NO_PUBKEY`. Its exit code alone would not say whose signature it was.
+for nothing, and the verdict is read from its status lines, because its exit code alone would not
+say whose signature it was. A release is accepted when there is at least one valid signature,
+every valid signature is from a pinned primary key, and the hash is strong (SHA-256 or better).
+`BADSIG`, `EXPKEYSIG`, `REVKEYSIG` and `EXPSIG` are always refused, and so is an `ERRSIG` for any
+reason except a missing key. A signature by a key this install does not have is ignored, which is
+what lets an install that still has only the old key accept a release signed with old and new key
+(gpgv then exits with 2); a release whose only signature is by an unknown key is refused.

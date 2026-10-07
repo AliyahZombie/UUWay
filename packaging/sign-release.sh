@@ -8,8 +8,8 @@
 #
 # Run it on the machine that holds the release key, after CI has drafted the release and
 # before it is published. It downloads the deb and SHA256SUMS from the draft, checks the
-# deb against SHA256SUMS, signs a SHA256SUMS it builds itself from the deb, uploads
-# SHA256SUMS.asc, and then verifies the result with the code the clients use.
+# deb against SHA256SUMS, signs a SHA256SUMS it builds itself from the deb, uploads that file and
+# its signature, and then downloads them again and verifies them with the code the clients use.
 # See docs/release-signing.md.
 set -Eeuo pipefail
 
@@ -62,8 +62,9 @@ fi
 printf '%s  %s\n' "$actual" "$deb" >"$work/SHA256SUMS"
 gpg --armor --detach-sign "${key_args[@]}" --output "$work/SHA256SUMS.asc" "$work/SHA256SUMS"
 
-# Verify with the code the clients run, against the key that is committed to the repository.
-python3 -I - "$repo_dir" "$work" "$tag" <<'PY'
+# The code the clients run, against the key that is committed to the repository.
+verify_as_client() {
+    python3 -I - "$repo_dir" "$1" "$tag" <<'PY'
 import importlib.util
 from pathlib import Path
 import sys
@@ -75,10 +76,27 @@ spec.loader.exec_module(apply)
 try:
     release = apply.check_release(stage, tag, '0', repo / 'config/uuway-release.gpg', apply.TRUSTED_FINGERPRINTS)
 except apply.VerifyError as error:
-    sys.exit(f'The signature does not verify the way a client would: {error}\n'
-             'Is the key you signed with the one in config/uuway-release.gpg and in TRUSTED_FINGERPRINTS?')
+    sys.exit(f'Does not verify the way a client would: {error}')
 print(f'Verified as a client would: {release.version}, sha256 {release.sha256}')
 PY
+}
 
-gh release upload "$tag" "$work/SHA256SUMS.asc" --clobber
+# Before anything is uploaded: is what was just signed good?
+verify_as_client "$work" || {
+    printf 'Is the key you signed with the one in config/uuway-release.gpg and in TRUSTED_FINGERPRINTS?\n' >&2
+    exit 1
+}
+
+# Clients fetch the release's own SHA256SUMS, so the file that was signed goes up with its signature:
+# a signature over bytes that are not on the release would be a BADSIG for everyone.
+gh release upload "$tag" "$work/SHA256SUMS" "$work/SHA256SUMS.asc" --clobber
+
+# And what clients will really get: download it again from the release and check that.
+published="$work/published"
+mkdir "$published"
+gh release download "$tag" --dir "$published" --pattern "$deb" --pattern SHA256SUMS --pattern SHA256SUMS.asc
+verify_as_client "$published" || {
+    printf 'The files on the published release do not verify. Do not publish %s; look at the release.\n' "$tag" >&2
+    exit 1
+}
 printf '\nSigned %s.\n  Review the draft, then publish it:\n  gh release edit %s --draft=false --latest\n' "$tag" "$tag"

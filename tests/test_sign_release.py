@@ -24,7 +24,17 @@ case "$1 $2" in
             case "$1" in --dir) dest="$2"; shift 2 ;; --pattern) patterns+=("$2"); shift 2 ;; *) shift ;; esac
         done
         for name in "${patterns[@]}"; do cp "$FAKE_RELEASE/$name" "$dest/$name"; done ;;
-    "release upload") cp "$4" "$FAKE_UPLOADS/" ; echo "uploaded $(basename "$4")" >> "$FAKE_UPLOADS/.log" ;;
+    "release upload")
+        shift 3
+        for file in "$@"; do
+            case "$file" in --clobber) continue ;; esac
+            cp "$file" "$FAKE_UPLOADS/"
+            echo "uploaded $(basename "$file")" >> "$FAKE_UPLOADS/.log"
+            # a release is the place clients download from: what is uploaded replaces what was there
+            if [ -z "${FAKE_DROP_UPLOAD:-}" ] || [ "$(basename "$file")" != "$FAKE_DROP_UPLOAD" ]; then
+                cp "$file" "$FAKE_RELEASE/$(basename "$file")"
+            fi
+        done ;;
     *) echo "unexpected gh call: $*" >&2; exit 99 ;;
 esac
 '''
@@ -90,9 +100,9 @@ class SignReleaseTests(unittest.TestCase):
         (self.release / "SHA256SUMS").write_text(f"{hashlib.sha256(deb.read_bytes()).hexdigest()}  {deb.name}\n")
         return deb
 
-    def sign(self, *arguments, home=None):
+    def sign(self, *arguments, home=None, **extra_environment):
         environment = dict(os.environ, PATH=f"{self.bin}:{os.environ['PATH']}", GNUPGHOME=str(home or self.home),
-                           FAKE_RELEASE=str(self.release), FAKE_UPLOADS=str(self.uploads))
+                           FAKE_RELEASE=str(self.release), FAKE_UPLOADS=str(self.uploads), **extra_environment)
         return subprocess.run(["bash", str(self.repo / "packaging/sign-release.sh"), *arguments],
                               capture_output=True, text=True, env=environment, cwd=self.root)
 
@@ -102,7 +112,7 @@ class SignReleaseTests(unittest.TestCase):
     def test_a_draft_is_signed_and_the_signature_is_uploaded(self):
         result = self.sign("v1.2.0")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.uploaded(), ["SHA256SUMS.asc"])
+        self.assertEqual(self.uploaded(), ["SHA256SUMS", "SHA256SUMS.asc"])  # the signed file goes up with its signature
         self.assertIn("Verified as a client would", result.stdout)
         self.assertIn("gh release edit v1.2.0 --draft=false --latest", result.stdout)
         # what was uploaded verifies, with the same code the clients run
@@ -112,7 +122,7 @@ class SignReleaseTests(unittest.TestCase):
         stage = self.root / "stage"
         stage.mkdir()
         shutil.copy(self.deb, stage)
-        shutil.copy(self.release / "SHA256SUMS", stage)
+        shutil.copy(self.uploads / "SHA256SUMS", stage)
         shutil.copy(self.uploads / "SHA256SUMS.asc", stage)
         release = apply.check_release(stage, "v1.2.0", "1.1.2", self.repo / "config/uuway-release.gpg",
                                       apply.TRUSTED_FINGERPRINTS)
@@ -126,17 +136,39 @@ class SignReleaseTests(unittest.TestCase):
         self.assertIn("Do not sign", result.stderr)
         self.assertEqual(self.uploaded(), [])
 
-    def test_the_signed_file_is_built_from_the_deb_not_taken_from_the_download(self):
-        (self.release / "SHA256SUMS").write_text(
-            f"{hashlib.sha256(self.deb.read_bytes()).hexdigest()}  {self.deb.name}\n{'0' * 64}  something-else\n")
+    def test_what_clients_download_is_exactly_what_was_signed(self):
+        # CI's SHA256SUMS differs from the one that gets signed (an extra line, no final newline): the
+        # signed file is uploaded too, so the release carries the bytes the signature is over.
+        digest = hashlib.sha256(self.deb.read_bytes()).hexdigest()
+        (self.release / "SHA256SUMS").write_text(f"{digest}  {self.deb.name}\n{'0' * 64}  something-else")
         result = self.sign("v1.2.0")
-        self.assertEqual(result.returncode, 0, result.stderr)  # the extra line is simply not what gets signed
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.release / "SHA256SUMS").read_text(), f"{digest}  {self.deb.name}\n")
+        spec = importlib.util.spec_from_file_location("apply", self.repo / "scripts/uuway_update_apply.py")
+        apply = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(apply)
+        published = self.root / "published"
+        published.mkdir()
+        for name in (self.deb.name, "SHA256SUMS", "SHA256SUMS.asc"):
+            shutil.copy(self.release / name, published)  # what a client would fetch from the release
+        apply.check_release(published, "v1.2.0", "1.1.2", self.repo / "config/uuway-release.gpg",
+                            apply.TRUSTED_FINGERPRINTS)
+
+    def test_if_the_published_files_do_not_verify_it_says_so(self):
+        # the upload of the checksums silently did not happen: the release would carry a signature
+        # over bytes that are not there
+        digest = hashlib.sha256(self.deb.read_bytes()).hexdigest()
+        (self.release / "SHA256SUMS").write_text(f"{digest}  {self.deb.name}\n{'0' * 64}  something-else\n")
+        result = self.sign("v1.2.0", FAKE_DROP_UPLOAD="SHA256SUMS")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("published", result.stderr)
+        self.assertNotIn("gh release edit", result.stdout)  # it must not invite anyone to publish
 
     def test_a_signature_by_the_wrong_key_is_not_uploaded(self):
         other_home, _ = self.make_key("intruder")
         result = self.sign("v1.2.0", home=other_home)
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("does not verify the way a client would", result.stderr)
+        self.assertIn("not verify the way a client would", result.stderr)
         self.assertEqual(self.uploaded(), [])
 
     def test_the_key_flag_decides_which_key_signs(self):
@@ -152,7 +184,7 @@ class SignReleaseTests(unittest.TestCase):
         self.assertEqual(self.uploaded(), [])
         right = self.sign("v1.2.0", "--key", self.fingerprint)
         self.assertEqual(right.returncode, 0, right.stderr)
-        self.assertEqual(self.uploaded(), ["SHA256SUMS.asc"])
+        self.assertEqual(self.uploaded(), ["SHA256SUMS", "SHA256SUMS.asc"])
 
     def test_a_published_release_needs_an_explicit_flag(self):
         (self.release / ".draft").write_text("false")
@@ -161,7 +193,7 @@ class SignReleaseTests(unittest.TestCase):
         self.assertIn("already published", result.stderr)
         self.assertEqual(self.uploaded(), [])
         self.assertEqual(self.sign("v1.2.0", "--allow-published").returncode, 0)
-        self.assertEqual(self.uploaded(), ["SHA256SUMS.asc"])
+        self.assertEqual(self.uploaded(), ["SHA256SUMS", "SHA256SUMS.asc"])
 
     def test_without_the_committed_keyring_it_refuses_to_start(self):
         (self.repo / "config/uuway-release.gpg").unlink()
