@@ -710,6 +710,8 @@ def finish_with(job, outcome, message, **extra):
     disarm_resume(job)
     shutil.rmtree(job.layout.work, ignore_errors=True)
     job.layout.work.mkdir(mode=0o700, exist_ok=True)
+    for staged in job.layout.new.glob('*'):  # the package is installed (or not); nothing needs this copy
+        staged.unlink()
     return outcome
 
 

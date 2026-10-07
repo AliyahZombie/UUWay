@@ -298,12 +298,28 @@ class SuccessfulUpdateTests(UpdateCase):
         self.assertLess(install, refresh)
 
     def test_apt_installs_the_verified_copy_without_recommends(self):
+        seen = []
+        original = Machine.__call__
+
+        def look(machine, argv, **kwargs):
+            if argv[0] == "apt-get" and "-s" not in argv and "install" in argv:
+                deb = Path(argv[-1])  # the file has to be right at the moment apt reads it
+                seen.append((list(argv), deb.parent, deb.read_bytes(), deb.stat().st_mode & 0o777))
+            return original(machine, argv, **kwargs)
+        self.machine.__class__ = type("Looking", (Machine,), {"__call__": look})
         self.update()
-        install = [argv for argv in self.machine.ran("apt-get", "install") if "-s" not in argv][0]
-        self.assertIn("--no-install-recommends", install)
-        self.assertEqual(Path(install[-1]).parent, self.layout.new)  # not the user's download
-        self.assertEqual(Path(install[-1]).read_bytes(), b"new package")
-        self.assertEqual(Path(install[-1]).stat().st_mode & 0o777, 0o644)
+        (argv, parent, content, mode), = seen
+        self.assertIn("--no-install-recommends", argv)
+        self.assertEqual(parent, self.layout.new)  # not the user's download
+        self.assertEqual((content, mode), (b"new package", 0o644))
+
+    def test_the_staged_copy_does_not_outlive_the_update(self):
+        self.update()
+        self.assertEqual(list(self.layout.new.iterdir()), [])
+        self.setUp()
+        self.machine.bad_versions.add("1.2.1")
+        self.update()
+        self.assertEqual(list(self.layout.new.iterdir()), [])  # nor a rolled-back one
 
     def test_the_refresh_runs_as_the_user_with_the_desktop_environment(self):
         self.update()

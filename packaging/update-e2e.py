@@ -170,7 +170,7 @@ def update(tag, stage):
     return outcome, apply.read_json(apply.Layout().result)
 
 
-def main(original):
+def scenarios(original):
     base, fingerprint, test_keyring = make_key('release')
     other_base, _, _ = make_key('intruder')
     apply.TRUSTED_FINGERPRINTS = (fingerprint,)
@@ -196,10 +196,12 @@ def main(original):
     for name, version, options in refusals:
         options = dict(options)
         stage = make_release(version, options.pop('base', base), source_deb=original, **options)
+        staged_before = sorted(Path('/var/lib/uuway/update/new').glob('*'))
         outcome, result = update(f'v{version}', stage)
         check(f'{name} is refused', outcome == 'not_started' and installed_version() == start and dpkg_clean(),
               f'{outcome} {result} installed={installed_version()}')
-        check(f'  and nothing was staged for apt: {name}', not list(Path('/var/lib/uuway/update/new').glob('*.deb')))
+        check(f'  and nothing was staged for apt: {name}',
+              sorted(Path('/var/lib/uuway/update/new').glob('*')) == staged_before)
 
     print('\n── a newer signed version is installed')
     stage = make_release('99.0.0', base, source_deb=original)
@@ -229,8 +231,25 @@ def main(original):
     check('the result says so', (result or {}).get('outcome') == 'rolled_back' and (result or {}).get('rolled_back_to') == '99.0.0', result)
     check('no resume unit is left behind', not Path('/etc/systemd/system/uuway-update-resume.service').exists())
 
-    shutil.rmtree(work, ignore_errors=True)
     return 1 if failures else 0
+
+
+def main(original):
+    """Run the scenarios, then put the release keyring back as it was.
+
+    The test swaps in its own key.  Until the package ships a release key the file is not the
+    package's, so dpkg would leave it (and the directory around it) behind on removal.
+    """
+    had_keyring = KEYRING.exists()
+    saved = KEYRING.read_bytes() if had_keyring else b''
+    try:
+        return scenarios(original)
+    finally:
+        if had_keyring:
+            KEYRING.write_bytes(saved)
+        else:
+            KEYRING.unlink(missing_ok=True)
+        shutil.rmtree(work, ignore_errors=True)
 
 
 if __name__ == '__main__':
