@@ -562,6 +562,60 @@ class StepSelectionTests(CliCase):
             self.assertFalse(cli.wine_done(ctx))
 
 
+class ElevationTests(CliCase):
+    """A shell reached through UU's terminal or SSH has DISPLAY set, but nobody watches that desktop."""
+
+    BRIDGE_CGROUP = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/uu-native-bridge.service\n"
+    DESKTOP_CGROUP = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-gnome-terminal.scope\n"
+
+    def elevate(self, *, environment, cgroup, pkexec=True, terminal=False, **options):
+        cgroup_file = self.root / "cgroup"
+        cgroup_file.write_text(cgroup)
+        which = "/usr/bin/pkexec" if pkexec else None
+        with patch.dict(os.environ, environment, clear=True), \
+                patch.object(cli, "CGROUP_FILE", cgroup_file), \
+                patch.object(cli.shutil, "which", return_value=which), \
+                patch.object(cli.sys.stdin, "isatty", return_value=terminal):
+            return self.context().elevate(["true"], **options)
+
+    def test_a_local_desktop_session_still_gets_the_polkit_dialog(self):
+        self.assertEqual(self.elevate(environment={"WAYLAND_DISPLAY": "wayland-0"}, cgroup=self.DESKTOP_CGROUP),
+                         ["pkexec", "true"])
+
+    def test_the_uu_terminal_asks_for_sudo_in_the_terminal_instead(self):
+        environment = {"WAYLAND_DISPLAY": "wayland-0", "DISPLAY": ":0"}
+        self.assertEqual(self.elevate(environment=environment, cgroup=self.BRIDGE_CGROUP), ["sudo", "true"])
+
+    def test_ssh_asks_for_sudo_even_with_a_forwarded_display(self):
+        for variable in ("SSH_CONNECTION", "SSH_TTY"):
+            environment = {"DISPLAY": "localhost:10.0", variable: "x"}
+            self.assertEqual(self.elevate(environment=environment, cgroup=self.DESKTOP_CGROUP), ["sudo", "true"], variable)
+
+    def test_no_desktop_or_no_pkexec_means_sudo(self):
+        self.assertEqual(self.elevate(environment={}, cgroup=self.DESKTOP_CGROUP), ["sudo", "true"])
+        self.assertEqual(self.elevate(environment={"DISPLAY": ":0"}, cgroup=self.DESKTOP_CGROUP, pkexec=False),
+                         ["sudo", "true"])
+
+    def test_an_unreadable_cgroup_file_does_not_hide_the_dialog(self):
+        with patch.dict(os.environ, {"DISPLAY": ":0"}, clear=True), \
+                patch.object(cli, "CGROUP_FILE", self.root / "missing"), \
+                patch.object(cli.shutil, "which", return_value="/usr/bin/pkexec"):
+            self.assertEqual(self.context().elevate(["true"]), ["pkexec", "true"])
+
+    def test_terminal_first_prefers_sudo_whenever_someone_can_type(self):
+        environment = {"WAYLAND_DISPLAY": "wayland-0"}
+        self.assertEqual(self.elevate(environment=environment, cgroup=self.DESKTOP_CGROUP, terminal=True,
+                                      terminal_first=True), ["sudo", "true"])
+        self.assertEqual(self.elevate(environment=environment, cgroup=self.DESKTOP_CGROUP, terminal=False,
+                                      terminal_first=True), ["pkexec", "true"])
+
+    def test_the_prompts_say_which_kind_of_authorization_to_expect(self):
+        with patch.object(cli.Context, "elevate", return_value=["pkexec"]):
+            self.assertIn("授权窗口", self.context().elevation_hint())
+        with patch.object(cli.Context, "elevate", return_value=["sudo"]):
+            self.assertIn("sudo 密码", self.context().elevation_hint())
+
+
 class DryRunTests(CliCase):
     def test_dry_run_setup_changes_nothing_on_disk(self):
         args = cli.build_parser().parse_args(["setup", "--dry-run", "--yes"])

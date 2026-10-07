@@ -42,6 +42,8 @@ GDM_TRUE = ('true', '1', 'yes')
 UDEV_RULE = '70-uurb-native-input.rules'
 SHIPPED_RULE = Path('/usr/lib/udev/rules.d') / UDEV_RULE
 LEGACY_RULE = Path('/etc/udev/rules.d') / UDEV_RULE
+BRIDGE_UNIT = 'uu-native-bridge.service'
+CGROUP_FILE = Path('/proc/self/cgroup')
 SERVICE_MARKER = '# Managed by UURB native installer;'
 DESKTOP_MARKER = '# Managed by UUWay console installer'
 FCITX_MARKER = '# Managed by uuway setup'
@@ -84,6 +86,21 @@ def warn(text):
 
 class SetupError(Exception):
     """A step cannot continue; the message tells the user what to do."""
+
+
+def remote_session():
+    """True when the shell came in through UU's own terminal or SSH.
+
+    Such a shell inherits DISPLAY and WAYLAND_DISPLAY from the desktop, but nobody is
+    sitting there: a polkit dialog would open on an empty screen and the command would
+    wait for ever.  UU's terminal is recognised by its cgroup, the bridge service.
+    """
+    if os.environ.get('SSH_CONNECTION') or os.environ.get('SSH_TTY'):
+        return True
+    try:
+        return BRIDGE_UNIT in CGROUP_FILE.read_text()
+    except OSError:
+        return False
 
 
 class Context:
@@ -157,10 +174,22 @@ class Context:
             return
         input(f'   {what}，完成后按回车继续…')
 
-    def elevate(self, argv):
-        """pkexec when a desktop session can show its prompt, sudo otherwise."""
+    def elevate(self, argv, *, terminal_first=False):
+        """pkexec when someone at the local desktop can answer its dialog, sudo otherwise.
+
+        sudo asks in the terminal the command runs in, which is where a remote user is.
+        `terminal_first` is for commands that must not be left waiting for a dialog:
+        whenever a person can type here, ask here.
+        """
         graphical = os.environ.get('WAYLAND_DISPLAY') or os.environ.get('DISPLAY')
-        return (['pkexec'] if shutil.which('pkexec') and graphical else ['sudo']) + list(argv)
+        use_dialog = shutil.which('pkexec') and graphical and not remote_session()
+        if terminal_first and sys.stdin.isatty():
+            use_dialog = False
+        return (['pkexec'] if use_dialog else ['sudo']) + list(argv)
+
+    def elevation_hint(self):
+        """What the user should expect after saying yes, for confirmation prompts."""
+        return '会弹出授权窗口' if self.elevate([])[0] == 'pkexec' else '会在终端里要求输入 sudo 密码'
 
 
 def systemctl(ctx, *args):
@@ -295,7 +324,7 @@ def udev_done(ctx):
 def udev_run(ctx):
     info('键鼠注入需要当前桌面用户能访问 /dev/uinput（只授予本地登录会话，不改用户组）。')
     if not (SHIPPED_RULE.is_file() or LEGACY_RULE.is_file()):
-        if not ctx.confirm('现在安装 udev 规则？（会弹出授权窗口）'):
+        if not ctx.confirm(f'现在安装 udev 规则？（{ctx.elevation_hint()}）'):
             raise SetupError('没有输入权限，已停止。')
         ctx.run(ctx.elevate(['install', '-m', '0644', str(udev_rule_source()), str(LEGACY_RULE)]))
         ctx.run(ctx.elevate(['udevadm', 'control', '--reload']))
@@ -865,7 +894,7 @@ def autologin_run(ctx):
             (ctx.state_dir / 'autologin-declined').touch(mode=0o600)
             info('不开启。以后需要：uuway autologin on')
             return
-    elif not ctx.confirm(f'为 {user} 开启{what}？（会弹出授权窗口）'):
+    elif not ctx.confirm(f'为 {user} 开启{what}？（{ctx.elevation_hint()}）'):
         raise SetupError('没有开启自动登录。')
     text = path.read_text()
     if need_boot:
