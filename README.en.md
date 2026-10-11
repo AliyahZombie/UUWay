@@ -110,7 +110,7 @@ device list. The wizard's messages are in Chinese.
 - With Fcitx5, the wizard enables the add-on that phone text input needs; run `fcitx5 -r` once for it
   to load.
 - Upgrade with `uuway update` (is there a newer release?) and `uuway update install` (download, verify the
-  signature, install). It then runs `uuway refresh`, waits for the machine to be back online and stable for about
+  checksum, install). It then runs `uuway refresh`, waits for the machine to be back online and stable for about
   90 seconds, and rolls back to the version before the update if it is not. The remote connection drops for a few
   minutes, but the update runs on its own in the background, so it is safe to start it from UU's own remote
   terminal; reconnect and run `uuway update status` for the result. If the machine does not log itself back in
