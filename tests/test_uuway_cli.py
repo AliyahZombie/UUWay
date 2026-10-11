@@ -627,19 +627,11 @@ class FakeUpdateFetcher:
         self.calls = []
         self.tag = "v1.2.1"
         self.etag = '"e1"'
-        self.unsigned = False
         self.not_modified = False
         self.failure = None
-        self.asc_failure = None
 
     def get(self, url, limit, headers=None):
         self.calls.append(("get", url, dict(headers or {})))
-        if url.endswith("SHA256SUMS.asc"):  # does the release carry its signature yet?
-            if self.unsigned:
-                raise cli.uuway_update.NotFound("x")
-            if self.asc_failure:
-                raise self.asc_failure
-            return b"sig", {}
         if self.failure:
             raise self.failure
         if self.not_modified and (headers or {}).get("If-None-Match"):
@@ -651,8 +643,6 @@ class FakeUpdateFetcher:
     def save(self, url, path, limit):
         self.calls.append(("save", url, limit))
         name = url.rsplit("/", 1)[1]
-        if name == "SHA256SUMS.asc" and self.unsigned:
-            raise cli.uuway_update.NotFound("x")
         Path(path).write_bytes(b"deb" * 1000 if name.endswith(".deb") else b"x" * 10)
 
 
@@ -679,15 +669,15 @@ class UpdateCase(CliCase):
         self.progress = []
         self.baseline = dict(self.HEALTHY)
 
-        def check_release(stage, tag, installed, keyring, fingerprints, *, run):
+        def check_release(stage, tag, installed, *, run):
             self.checked = (tag, installed)
             deb = Path(stage) / f"uuway_{tag[1:]}_amd64.deb"
             return cli.update_checks.Release(tag[1:], deb, "0" * 64)
         self.checked = None
-        self.signed_checks = []
+        self.early_checks = []
 
-        def check_signed_checksums(stage, tag, keyring, fingerprints, *, run):
-            self.signed_checks.append((Path(stage), tag))
+        def check_checksums(stage, tag):
+            self.early_checks.append((Path(stage), tag))
             return "0" * 64
         for override in (patch.object(cli, "DEB_ROOT", self.checkout.resolve()),
                          patch.object(cli, "UPDATE_STATE", self.state),
@@ -696,7 +686,7 @@ class UpdateCase(CliCase):
                          patch.object(cli, "health_baseline", lambda ctx: self.baseline),
                          patch.object(cli, "timed_state", lambda ctx: (self.recovery_layer, cli.getpass.getuser())),
                          patch.object(cli, "follow_progress", self.follow),
-                         patch.object(cli.update_checks, "check_signed_checksums", check_signed_checksums),
+                         patch.object(cli.update_checks, "check_checksums", check_checksums),
                          patch.object(cli.update_checks, "check_release", check_release)):
             override.start()
             self.addCleanup(override.stop)
@@ -706,7 +696,7 @@ class UpdateCase(CliCase):
         return 0
 
     def api_calls(self):
-        """The requests to GitHub's API (as opposed to the one that looks for the signature file)."""
+        """The requests to GitHub's API (as opposed to the downloads)."""
         return [call for call in self.fetcher.calls if call[1] == cli.uuway_update.API_URL]
 
     def update_context(self, action="install", yes=True, dry_run=False, reboot=False, source=None, tag=None):
@@ -757,25 +747,6 @@ class UpdateCheckTests(UpdateCase):
         self.assertIn("1.2.1", output)
         self.assertIn("uuway update install", output)
         self.assertEqual(self.commands, [])  # a check never touches the system
-
-    def test_a_release_without_its_signature_is_said_not_to_be_installable_yet(self):
-        self.fetcher.unsigned = True
-        _, (code, output) = self.check()
-        self.assertEqual(code, 0)
-        self.assertIn("还没有签名", output)
-        self.assertNotIn("安装：uuway update install", output)
-
-    def test_a_signed_release_gets_the_install_hint(self):
-        _, (code, output) = self.check()
-        self.assertNotIn("还没有签名", output)
-        self.assertIn("uuway update install", output)
-
-    def test_when_the_signature_cannot_be_looked_for_nothing_is_claimed(self):
-        self.fetcher.asc_failure = cli.uuway_update.FetchError("无法连接 GitHub")
-        _, (code, output) = self.check()
-        self.assertEqual(code, 0)
-        self.assertNotIn("还没有签名", output)
-        self.assertIn("有新版本", output)
 
     def test_the_answer_is_cached_privately_for_doctor(self):
         ctx, _ = self.check()
@@ -859,27 +830,23 @@ class UpdateRefusalTests(UpdateCase):
         self.assertEqual(self.launched(), [])
         self.assertFalse([call for call in self.fetcher.calls if call[0] == "save"])
 
-    def test_an_unsigned_release_is_reported_and_nothing_is_elevated(self):
-        self.fetcher.unsigned = True
-        self.refused("还没有签名")
-
     def test_a_release_that_fails_verification_is_not_installed(self):
         def refuse(*args, **kwargs):
-            raise cli.update_checks.VerifyError("签名校验失败（BADSIG）。")
+            raise cli.update_checks.VerifyError("哈希校验失败。")
         with patch.object(cli.update_checks, "check_release", refuse):
-            self.refused("BADSIG")
+            self.refused("哈希校验失败")
 
-    def test_a_bad_signature_is_found_before_the_deb_is_downloaded(self):
+    def test_bad_checksums_are_found_before_the_deb_is_downloaded(self):
         def refuse(*args, **kwargs):
-            raise cli.update_checks.VerifyError("签名校验失败（BADSIG）。")
-        with patch.object(cli.update_checks, "check_signed_checksums", refuse):
-            self.refused("BADSIG")
+            raise cli.update_checks.VerifyError("SHA256SUMS 里没有这个版本的校验和。")
+        with patch.object(cli.update_checks, "check_checksums", refuse):
+            self.refused("校验和")
         saved = [call[1].rsplit("/", 1)[1] for call in self.fetcher.calls if call[0] == "save"]
-        self.assertEqual(sorted(saved), ["SHA256SUMS", "SHA256SUMS.asc"])  # the megabytes were never fetched
+        self.assertEqual(saved, ["SHA256SUMS"])  # the megabytes were never fetched
 
-    def test_the_early_check_gets_the_two_small_files_and_the_tag(self):
+    def test_the_early_check_gets_the_checksums_and_the_tag(self):
         self.install()
-        ((stage, tag),) = self.signed_checks
+        ((stage, tag),) = self.early_checks
         self.assertEqual(tag, "v1.2.1")
         self.assertEqual(stage.name, "1.2.1")
 
@@ -1012,7 +979,7 @@ class UpdateLaunchTests(UpdateCase):
         stage = Path(arguments["--stage"])
         self.assertEqual(stage, ctx.state_dir / "update/1.2.1")
         self.assertEqual(sorted(path.name for path in stage.iterdir()),
-                         ["SHA256SUMS", "SHA256SUMS.asc", "baseline.json", "uuway_1.2.1_amd64.deb"])
+                         ["SHA256SUMS", "baseline.json", "uuway_1.2.1_amd64.deb"])
         baseline = json.loads((stage / "baseline.json").read_text())
         self.assertEqual(baseline["processes"], {"GameViewerServer.exe": 1})
         self.assertEqual(Path(arguments["--baseline"]), stage / "baseline.json")
@@ -1084,7 +1051,7 @@ class UpdateSourceTests(UpdateCase):
     def staged(self, name="rehearsal"):
         stage = self.root / name
         stage.mkdir()
-        for file in ("SHA256SUMS", "SHA256SUMS.asc", "uuway_1.2.1_amd64.deb"):
+        for file in ("SHA256SUMS", "uuway_1.2.1_amd64.deb"):
             (stage / file).write_bytes(b"x" * 10)
         return stage
 
@@ -1107,12 +1074,12 @@ class UpdateSourceTests(UpdateCase):
 
     def test_it_is_checked_exactly_like_a_download(self):
         def refuse(*args, **kwargs):
-            raise cli.update_checks.VerifyError("签名校验失败（BADSIG）。")
+            raise cli.update_checks.VerifyError("哈希校验失败。")
         stage = self.staged()
         ctx, args = self.update_context(source=stage, tag="v1.2.1")
         with patch.object(cli.update_checks, "check_release", refuse), \
                 patch.object(cli.sys.stdin, "isatty", return_value=True), \
-                self.assertRaisesRegex(cli.SetupError, "BADSIG"):
+                self.assertRaisesRegex(cli.SetupError, "哈希校验失败"):
             self.quiet(cli.update_install, ctx, args)
         self.assertEqual(self.launched(), [])
 
@@ -1135,7 +1102,7 @@ class UpdateSourceTests(UpdateCase):
         ctx, args = self.update_context(source=self.root / "x", tag="v1.2.1")
         inside = ctx.state_dir / "update" / "1.2.1"  # where downloads normally go
         inside.mkdir(parents=True)
-        for file in ("SHA256SUMS", "SHA256SUMS.asc", "uuway_1.2.1_amd64.deb"):
+        for file in ("SHA256SUMS", "uuway_1.2.1_amd64.deb"):
             (inside / file).write_bytes(b"x")
         ctx, args, _ = self.install_from(inside)
         self.assertTrue((inside / "uuway_1.2.1_amd64.deb").is_file())

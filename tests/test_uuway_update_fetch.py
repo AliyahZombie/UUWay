@@ -258,43 +258,22 @@ class LatestReleaseTests(unittest.TestCase):
                 self.latest(body)
 
 
-class ReleaseIsSignedTests(unittest.TestCase):
-    URL = "https://github.com/GaryOAO/UUWay/releases/download/v1.2.1/SHA256SUMS.asc"
-
-    def test_a_signature_asset_means_signed(self):
-        self.assertTrue(update.release_is_signed(FakeFetcher({self.URL: b"sig"}), "v1.2.1"))
-
-    def test_no_signature_asset_means_not_signed_yet(self):
-        self.assertFalse(update.release_is_signed(FakeFetcher({self.URL: update.NotFound("x")}), "v1.2.1"))
-
-    def test_when_it_cannot_be_told_it_says_so_instead_of_guessing(self):
-        with self.assertRaises(update.FetchError):
-            update.release_is_signed(FakeFetcher({self.URL: update.FetchError("无法连接 GitHub")}), "v1.2.1")
-
-    def test_a_bad_tag_is_refused_before_any_request(self):
-        fetcher = FakeFetcher({})
-        with self.assertRaises(update.FetchError):
-            update.release_is_signed(fetcher, "latest")
-        self.assertEqual(fetcher.calls, [])
-
-
 class DownloadReleaseTests(unittest.TestCase):
     BASE = "https://github.com/GaryOAO/UUWay/releases/download/v1.2.1/"
 
     def answers(self, **changes):
-        answers = {self.BASE + "SHA256SUMS": b"sums", self.BASE + "SHA256SUMS.asc": b"sig",
-                   self.BASE + "uuway_1.2.1_amd64.deb": b"deb"}
+        answers = {self.BASE + "SHA256SUMS": b"sums", self.BASE + "uuway_1.2.1_amd64.deb": b"deb"}
         answers.update(changes)
         return answers
 
-    def test_three_files_are_fetched_from_urls_built_from_the_tag(self):
+    def test_two_files_are_fetched_from_urls_built_from_the_tag(self):
         with tempfile.TemporaryDirectory() as directory:
             fetcher = FakeFetcher(self.answers())
             stage = Path(directory) / "update/1.2.1"
             result = update.download_release(fetcher, "v1.2.1", stage)
             self.assertEqual(result, stage)
             self.assertEqual(sorted(path.name for path in stage.iterdir()),
-                             ["SHA256SUMS", "SHA256SUMS.asc", "uuway_1.2.1_amd64.deb"])
+                             ["SHA256SUMS", "uuway_1.2.1_amd64.deb"])
             self.assertEqual(stage.stat().st_mode & 0o777, 0o700)
             urls = [call[1] for call in fetcher.calls]
             self.assertTrue(all(url.startswith(self.BASE) for url in urls), urls)
@@ -302,25 +281,35 @@ class DownloadReleaseTests(unittest.TestCase):
             self.assertEqual(limits["uuway_1.2.1_amd64.deb"], update.DEB_LIMIT)
             self.assertEqual(limits["SHA256SUMS"], update.SMALL_LIMIT)
 
-    def test_the_small_files_can_be_checked_before_the_deb_is_downloaded(self):
+    def test_the_checksums_can_be_checked_before_the_deb_is_downloaded(self):
         with tempfile.TemporaryDirectory() as directory:
             fetcher = FakeFetcher(self.answers())
             seen = []
 
             def refuse(stage):
                 seen.append(sorted(path.name for path in Path(stage).iterdir()))
-                raise update.checks.VerifyError("签名校验失败（BADSIG）。")
-            with self.assertRaisesRegex(update.checks.VerifyError, "BADSIG"):
+                raise update.checks.VerifyError("SHA256SUMS 里没有这个版本的校验和。")
+            with self.assertRaisesRegex(update.checks.VerifyError, "校验和"):
                 update.download_release(fetcher, "v1.2.1", Path(directory) / "s", before_deb=refuse)
-            self.assertEqual(seen, [["SHA256SUMS", "SHA256SUMS.asc"]])  # exactly the two small files were there
+            self.assertEqual(seen, [["SHA256SUMS"]])  # only the small file was there
             self.assertFalse(any(call[1].endswith(".deb") for call in fetcher.calls))
 
-    def test_a_release_without_a_signature_is_reported_before_the_deb_is_downloaded(self):
+    def test_a_release_without_checksums_is_reported_before_the_deb_is_downloaded(self):
         with tempfile.TemporaryDirectory() as directory:
-            fetcher = FakeFetcher(self.answers(**{self.BASE + "SHA256SUMS.asc": update.NotFound("x")}))
-            with self.assertRaises(update.Unsigned):
+            fetcher = FakeFetcher(self.answers(**{self.BASE + "SHA256SUMS": update.NotFound("x")}))
+            with self.assertRaisesRegex(update.FetchError, "SHA256SUMS"):
                 update.download_release(fetcher, "v1.2.1", Path(directory) / "s")
             self.assertFalse(any(call[1].endswith(".deb") for call in fetcher.calls))
+
+    def test_a_release_without_its_deb_is_reported(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fetcher = FakeFetcher(self.answers(**{self.BASE + "uuway_1.2.1_amd64.deb": update.NotFound("x")}))
+            with self.assertRaisesRegex(update.FetchError, "uuway_1.2.1_amd64.deb"):
+                update.download_release(fetcher, "v1.2.1", Path(directory) / "s")
+
+    def test_there_is_no_signature_to_ask_for(self):
+        self.assertFalse(hasattr(update, "release_is_signed"))
+        self.assertFalse(hasattr(update, "Unsigned"))
 
     def test_a_bad_tag_is_refused_before_any_request(self):
         fetcher = FakeFetcher({})

@@ -24,11 +24,6 @@ jobs:
         run: |
           if [[ "$GITHUB_REF_TYPE" == tag ]]; then version="${GITHUB_REF_NAME#v}"; else version="${{ inputs.version }}"; fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
-      # A release without the key that `uuway update` trusts would ship an updater that refuses everything,
-      # and a new key can only reach machines through a release signed with the old one.
-      - name: Check that the release key is in place
-        if: github.ref_type == 'tag'
-        run: python3 packaging/check-release-key.py
       # The same scripts a maintainer runs locally: a clean Ubuntu 24.04 container does the build.
       - name: Build the package
         run: packaging/build-deb.sh --version "${{ steps.version.outputs.version }}" --output-dir out

@@ -1,11 +1,9 @@
-"""uuway update: what is trusted, and what is refused, before anything is installed as root."""
+"""uuway update: what is believed, and what is refused, before anything is installed as root."""
 import hashlib
 import importlib.util
-import os
 from pathlib import Path
 import shutil
 import subprocess
-import sys
 import tempfile
 import unittest
 
@@ -14,12 +12,7 @@ spec = importlib.util.spec_from_file_location("uuway_update_apply", ROOT / "scri
 apply = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(apply)
 
-HAVE_GPG = bool(shutil.which("gpg") and shutil.which("gpgv"))
 HAVE_DPKG = bool(shutil.which("dpkg-deb") and shutil.which("dpkg"))
-
-
-def completed(argv, code=0, out=""):
-    return subprocess.CompletedProcess(argv, code, stdout=out, stderr="")
 
 
 class Workspace(unittest.TestCase):
@@ -27,34 +20,6 @@ class Workspace(unittest.TestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
-        self.homes = []
-        self.addCleanup(self.stop_agents)
-
-    def stop_agents(self):
-        for home in self.homes:
-            subprocess.run(["gpgconf", "--homedir", str(home), "--kill", "all"], capture_output=True, check=False)
-
-    def gpg(self, home, *arguments, **kwargs):
-        return subprocess.run(["gpg", "--homedir", str(home), "--batch", "--pinentry-mode", "loopback",
-                               "--passphrase", "", *arguments], check=True, capture_output=True, **kwargs)
-
-    def make_key(self, name):
-        """A throwaway Ed25519 key: (gnupg home, primary fingerprint, binary keyring file)."""
-        home = self.root / f"gnupg-{name}"
-        home.mkdir(mode=0o700)
-        self.homes.append(home)
-        self.gpg(home, "--quick-generate-key", f"{name} <{name}@example.invalid>", "ed25519", "sign", "never")
-        listing = self.gpg(home, "--with-colons", "--list-keys", text=True).stdout
-        fingerprint = next(line.split(":")[9] for line in listing.splitlines() if line.startswith("fpr:"))
-        keyring = self.root / f"{name}.gpg"
-        keyring.write_bytes(self.gpg(home, "--export").stdout)
-        return home, fingerprint, keyring
-
-    def sign(self, home, sums):
-        signature = Path(str(sums) + ".asc")
-        signature.unlink(missing_ok=True)
-        self.gpg(home, "--yes", "--armor", "--detach-sign", "-o", str(signature), str(sums))
-        return signature
 
     def make_deb(self, path, version="1.2.1", package="uuway", architecture="amd64"):
         tree = Path(tempfile.mkdtemp(prefix="tree-", dir=self.root))
@@ -64,147 +29,85 @@ class Workspace(unittest.TestCase):
         subprocess.run(["dpkg-deb", "--root-owner-group", "-b", str(tree), str(path)], check=True, capture_output=True)
         return path
 
-    def release(self, home, version="1.2.1", sign=True, **deb_fields):
-        """A staged release as the updater downloads it: deb, SHA256SUMS, SHA256SUMS.asc."""
+    def release(self, version="1.2.1", **deb_fields):
+        """A staged release as the updater downloads it: the deb and SHA256SUMS."""
         stage = self.root / f"stage-{version}"
         stage.mkdir(exist_ok=True)
         deb = self.make_deb(stage / f"uuway_{version}_amd64.deb", version=deb_fields.pop("deb_version", version),
                             **deb_fields)
-        sums = stage / "SHA256SUMS"
-        sums.write_text(f"{hashlib.sha256(deb.read_bytes()).hexdigest()}  {deb.name}\n")
-        if sign:
-            self.sign(home, sums)
+        (stage / "SHA256SUMS").write_text(f"{hashlib.sha256(deb.read_bytes()).hexdigest()}  {deb.name}\n")
         return stage
 
 
-@unittest.skipUnless(HAVE_GPG and HAVE_DPKG, "gpg, gpgv and dpkg-deb are needed")
+@unittest.skipUnless(HAVE_DPKG, "dpkg-deb is needed")
 class CheckReleaseTests(Workspace):
-    def setUp(self):
-        super().setUp()
-        self.home, self.fingerprint, self.keyring = self.make_key("release")
+    def check(self, stage, tag="v1.2.1", installed="1.2.0"):
+        return apply.check_release(stage, tag, installed)
 
-    def check(self, stage, tag="v1.2.1", installed="1.2.0", keyring=None, fingerprints=None):
-        return apply.check_release(stage, tag, installed, keyring or self.keyring,
-                                   fingerprints if fingerprints is not None else (self.fingerprint,))
-
-    def test_a_signed_release_is_accepted(self):
-        result = self.check(self.release(self.home))
+    def test_a_release_whose_deb_matches_its_checksums_is_accepted(self):
+        result = self.check(self.release())
         self.assertEqual(result.version, "1.2.1")
         self.assertEqual(result.deb.name, "uuway_1.2.1_amd64.deb")
         self.assertEqual(result.sha256, hashlib.sha256(result.deb.read_bytes()).hexdigest())
 
-    def test_the_signed_checksums_can_be_checked_without_the_deb(self):
-        stage = self.release(self.home)
-        digest = apply.check_signed_checksums(stage, "v1.2.1", self.keyring, (self.fingerprint,))
+    def test_the_checksum_can_be_read_without_the_deb(self):
+        stage = self.release()
+        digest = apply.check_checksums(stage, "v1.2.1")
         self.assertEqual(digest, hashlib.sha256((stage / "uuway_1.2.1_amd64.deb").read_bytes()).hexdigest())
         (stage / "uuway_1.2.1_amd64.deb").unlink()  # not needed for this
-        self.assertEqual(apply.check_signed_checksums(stage, "v1.2.1", self.keyring, (self.fingerprint,)), digest)
+        self.assertEqual(apply.check_checksums(stage, "v1.2.1"), digest)
 
     def test_that_early_check_refuses_what_the_full_check_refuses(self):
-        other_home, _, _ = self.make_key("intruder")
-        for stage, expected in ((self.release(other_home, version="1.2.3"), apply.VerifyError),
-                                (self.release(self.home, version="1.2.4", sign=False), apply.VerifyError)):
-            tag = f"v{stage.name.removeprefix('stage-')}"
-            with self.assertRaises(expected, msg=tag):
-                apply.check_signed_checksums(stage, tag, self.keyring, (self.fingerprint,))
+        stage = self.release()
+        (stage / "SHA256SUMS").unlink()
+        with self.assertRaisesRegex(apply.VerifyError, "SHA256SUMS"):
+            apply.check_checksums(stage, "v1.2.1")
+        (stage / "SHA256SUMS").write_text("a" * 64 + "  something-else.txt\n")  # does not list the deb
+        with self.assertRaisesRegex(apply.VerifyError, "SHA256SUMS"):
+            apply.check_checksums(stage, "v1.2.1")
         with self.assertRaisesRegex(apply.VerifyError, "tag"):
-            apply.check_signed_checksums(self.release(self.home, version="1.2.5"), "v1.2", self.keyring, (self.fingerprint,))
-
-    def test_the_full_check_still_stops_at_a_bad_signature_first(self):
-        other_home, _, _ = self.make_key("intruder")
-        stage = self.release(other_home)
-        with self.assertRaisesRegex(apply.VerifyError, "签名|指纹"):
-            self.check(stage)
+            apply.check_checksums(self.release(version="1.2.5"), "v1.2")
 
     def test_a_changed_deb_is_refused(self):
-        stage = self.release(self.home)
+        stage = self.release()
         with (stage / "uuway_1.2.1_amd64.deb").open("ab") as deb:
             deb.write(b"x")
         with self.assertRaisesRegex(apply.VerifyError, "哈希"):
             self.check(stage)
 
-    def test_changed_checksums_break_the_signature(self):
-        stage = self.release(self.home)
+    def test_a_cut_off_deb_is_refused(self):
+        stage = self.release()
+        deb = stage / "uuway_1.2.1_amd64.deb"
+        deb.write_bytes(deb.read_bytes()[:-5])
+        with self.assertRaisesRegex(apply.VerifyError, "哈希"):
+            self.check(stage)
+
+    def test_changed_checksums_are_refused(self):
+        stage = self.release()
         sums = stage / "SHA256SUMS"
         data = sums.read_bytes()
-        sums.write_bytes(bytes([data[0] ^ 1]) + data[1:])  # one character of the hash differs
-        with self.assertRaisesRegex(apply.VerifyError, "签名"):
+        sums.write_bytes((b"0" if data[:1] != b"0" else b"1") + data[1:])  # one character of the hash differs
+        with self.assertRaisesRegex(apply.VerifyError, "哈希"):
             self.check(stage)
 
-    def test_a_missing_signature_is_refused(self):
-        stage = self.release(self.home)
-        (stage / "SHA256SUMS.asc").unlink()
-        with self.assertRaisesRegex(apply.VerifyError, "签名"):
+    def test_missing_files_are_refused(self):
+        stage = self.release()
+        (stage / "uuway_1.2.1_amd64.deb").unlink()
+        with self.assertRaisesRegex(apply.VerifyError, "uuway_1.2.1_amd64.deb"):
             self.check(stage)
-
-    def test_a_release_signed_by_another_key_is_refused(self):
-        other_home, other_fingerprint, other_keyring = self.make_key("intruder")
-        stage = self.release(other_home)
-        with self.assertRaises(apply.VerifyError):
-            self.check(stage)  # the intruder's key is not in the shipped keyring
-        with self.assertRaisesRegex(apply.VerifyError, "指纹"):
-            self.check(stage, keyring=other_keyring)  # in the keyring, but not a pinned fingerprint
-
-    def test_keys_in_the_default_gnupg_home_are_not_honoured(self):
-        other_home, _, _ = self.make_key("intruder")
-        stage = self.release(other_home)
-        default_home = self.root / "default-gnupg"
-        default_home.mkdir(mode=0o700)
-        self.homes.append(default_home)
-        exported = self.gpg(other_home, "--export").stdout
-        subprocess.run(["gpg", "--homedir", str(default_home), "--batch", "--no-default-keyring",
-                        "--keyring", str(default_home / "trustedkeys.kbx"), "--import"],
-                       input=exported, check=True, capture_output=True)
-        previous = os.environ.get("GNUPGHOME")
-        os.environ["GNUPGHOME"] = str(default_home)
-        try:
-            with self.assertRaises(apply.VerifyError):
-                self.check(stage)
-        finally:
-            if previous is None:
-                os.environ.pop("GNUPGHOME")
-            else:
-                os.environ["GNUPGHOME"] = previous
-
-    def test_a_release_signed_twice_is_accepted_by_an_install_that_knows_only_one_key(self):
-        # Replacing the key: release N is signed with the old and the new key, and the install that
-        # verifies it is the old one, whose keyring and pinned fingerprints hold only the old key.
-        new_home, new_fingerprint, new_keyring = self.make_key("replacement")
-        exported = self.gpg(new_home, "--export-secret-keys").stdout
-        self.gpg(self.home, "--import", input=exported)
-        stage = self.release(self.home, sign=False)
-        sums = stage / "SHA256SUMS"
-        self.gpg(self.home, "--yes", "--armor", "--detach-sign", "--local-user", self.fingerprint,
-                 "--local-user", new_fingerprint, "-o", str(sums) + ".asc", str(sums))
-        result = self.check(stage)  # self.keyring and self.fingerprint: the old key only
-        self.assertEqual(result.version, "1.2.1")
-        both = self.root / "both.gpg"
-        both.write_bytes(self.keyring.read_bytes() + new_keyring.read_bytes())
-        self.assertEqual(self.check(stage, keyring=both, fingerprints=(self.fingerprint, new_fingerprint)).version, "1.2.1")
-        with self.assertRaisesRegex(apply.VerifyError, "指纹"):  # an install that trusts only the new key: the old
-            self.check(stage, keyring=both, fingerprints=(new_fingerprint,))  # signature is valid but not pinned
-
-    def test_a_release_signed_only_by_a_key_the_install_does_not_know_is_refused(self):
-        new_home, new_fingerprint, _ = self.make_key("replacement")
-        with self.assertRaises(apply.VerifyError):
-            self.check(self.release(new_home))
-
-    def test_without_a_pinned_fingerprint_nothing_is_trusted(self):
-        with self.assertRaisesRegex(apply.VerifyError, "指纹"):
-            self.check(self.release(self.home), fingerprints=())
-
-    def test_a_missing_keyring_is_refused(self):
-        with self.assertRaisesRegex(apply.VerifyError, "公钥"):
-            self.check(self.release(self.home), keyring=self.root / "no-such.gpg")
+        stage = self.release(version="1.2.2")
+        (stage / "SHA256SUMS").unlink()
+        with self.assertRaisesRegex(apply.VerifyError, "SHA256SUMS"):
+            self.check(stage, tag="v1.2.2")
 
     def test_only_plain_release_tags_are_accepted(self):
-        stage = self.release(self.home)
+        stage = self.release()
         for tag in ("v1.2", "1.2.1", "v1.2.1-rc1", "v1.2.1\n", "v1.2.1/../x", "V1.2.1", "v01.2.1x", ""):
             with self.assertRaisesRegex(apply.VerifyError, "tag", msg=repr(tag)):
                 self.check(stage, tag=tag)
 
-    def test_an_old_signed_release_cannot_be_replayed_under_a_newer_tag(self):
-        stage = self.release(self.home, version="1.2.0")
+    def test_an_old_release_cannot_be_replayed_under_a_newer_tag(self):
+        stage = self.release(version="1.2.0")
         shutil.copy(stage / "uuway_1.2.0_amd64.deb", stage / "uuway_1.2.1_amd64.deb")
         with self.assertRaisesRegex(apply.VerifyError, "SHA256SUMS"):
             self.check(stage, tag="v1.2.1", installed="1.1.2")
@@ -212,18 +115,23 @@ class CheckReleaseTests(Workspace):
     def test_the_deb_must_say_what_the_tag_says(self):
         for fields, expected in ((dict(deb_version="1.2.2"), "版本"), (dict(package="other"), "软件包"),
                                  (dict(architecture="arm64"), "架构")):
-            stage = self.release(self.home, **fields)
+            stage = self.release(**fields)
             with self.assertRaisesRegex(apply.VerifyError, expected, msg=str(fields)):
                 self.check(stage)
 
     def test_only_a_strictly_newer_version_is_accepted(self):
-        stage = self.release(self.home)
+        stage = self.release()
         self.check(stage, installed="1.2.0")
         self.check(stage, installed="1.1.2")
         self.check(stage, installed="0.0.0~git1234567")
         for installed in ("1.2.1", "1.3.0", "2.0.0"):
             with self.assertRaisesRegex(apply.VerifyError, "不比", msg=installed):
                 self.check(stage, installed=installed)
+
+    def test_there_is_no_signature_to_check(self):
+        # A release is a deb and its SHA256SUMS; nothing of the signing scheme is left to trip over.
+        for name in ("verify_signature", "check_signed_checksums", "KEYRING", "TRUSTED_FINGERPRINTS"):
+            self.assertFalse(hasattr(apply, name), name)
 
 
 class ChecksumFileTests(unittest.TestCase):
@@ -253,94 +161,6 @@ class ChecksumFileTests(unittest.TestCase):
         for text in bad:
             with self.assertRaises(apply.VerifyError, msg=repr(text)):
                 apply.parse_sums(text, name)
-
-
-class SignatureStatusTests(unittest.TestCase):
-    """What gpgv says is parsed from its status lines; its exit code alone is not enough."""
-
-    FPR = "A" * 40
-    SUBKEY = "B" * 40
-
-    def valid(self, primary=None, algorithm="10", subkey=None):
-        return (f"[GNUPG:] VALIDSIG {subkey or self.SUBKEY} 2026-10-07 1791360000 0 4 0 22 {algorithm} 00 "
-                f"{primary or self.FPR}\n")
-
-    def verify(self, output, code=0, fingerprints=None):
-        keyring = Path(tempfile.mkdtemp()) / "k.gpg"
-        keyring.write_bytes(b"x")
-        self.addCleanup(shutil.rmtree, keyring.parent)
-        return apply.verify_signature(Path("sums"), Path("sums.asc"), keyring,
-                                      fingerprints or (self.FPR,),
-                                      run=lambda argv, **kwargs: completed(argv, code, output))
-
-    def test_a_valid_signature_from_a_pinned_primary_key_is_accepted(self):
-        self.verify(self.valid())
-        self.verify(self.valid(algorithm="8"))
-        self.verify(self.valid(primary=self.FPR.lower()))
-
-    def test_the_primary_key_decides_not_the_signing_subkey(self):
-        self.verify(self.valid(subkey="C" * 40))
-        with self.assertRaisesRegex(apply.VerifyError, "指纹"):
-            self.verify(self.valid(primary="D" * 40))
-
-    def test_weak_hashes_are_refused(self):
-        for algorithm in ("1", "2", "3"):
-            with self.assertRaisesRegex(apply.VerifyError, "哈希算法", msg=algorithm):
-                self.verify(self.valid(algorithm=algorithm))
-
-    def test_every_bad_status_is_refused_even_next_to_a_valid_signature(self):
-        for status in ("BADSIG", "EXPKEYSIG", "REVKEYSIG", "EXPSIG"):
-            with self.assertRaises(apply.VerifyError, msg=status):
-                self.verify(self.valid() + f"[GNUPG:] {status} {self.FPR} x\n")
-
-    def test_an_error_that_is_not_a_missing_key_is_refused(self):
-        for reason in ("4", "1", "0", "99"):  # 4 is an algorithm gpgv does not know
-            with self.assertRaises(apply.VerifyError, msg=reason):
-                self.verify(self.valid() + f"[GNUPG:] ERRSIG {'C' * 16} 22 10 00 1791357456 {reason} {'D' * 40}\n", code=2)
-        with self.assertRaises(apply.VerifyError):
-            self.verify(self.valid() + "[GNUPG:] ERRSIG C 22\n", code=2)  # too short to say why
-
-    MISSING = "[GNUPG:] ERRSIG CCCCCCCCCCCCCCCC 22 10 00 1791357456 9 " + "D" * 40 + "\n[GNUPG:] NO_PUBKEY CCCCCCCCCCCCCCCC\n"
-
-    def test_a_signature_by_a_key_this_install_does_not_know_is_ignored(self):
-        # The old install checks the old key's signature on a release that was signed twice.
-        self.verify(self.valid() + self.MISSING, code=2)
-        self.verify(self.MISSING + self.valid(), code=2)
-
-    def test_a_missing_key_is_no_substitute_for_a_valid_signature(self):
-        with self.assertRaises(apply.VerifyError):
-            self.verify(self.MISSING, code=2)
-        with self.assertRaises(apply.VerifyError):
-            self.verify("[GNUPG:] NO_PUBKEY CCCCCCCCCCCCCCCC\n", code=2)
-
-    def test_exit_code_two_is_only_understood_next_to_a_missing_key(self):
-        with self.assertRaises(apply.VerifyError):
-            self.verify(self.valid(), code=2)  # nothing explains the failure
-        with self.assertRaises(apply.VerifyError):
-            self.verify(self.valid() + self.MISSING, code=1)
-
-    def test_a_failing_exit_code_or_no_valid_signature_is_refused(self):
-        with self.assertRaises(apply.VerifyError):
-            self.verify(self.valid(), code=1)
-        with self.assertRaises(apply.VerifyError):
-            self.verify("[GNUPG:] NEWSIG\n")
-        with self.assertRaises(apply.VerifyError):
-            self.verify("")
-
-    def test_two_signatures_are_fine_during_a_key_rotation(self):
-        second = "E" * 40
-        self.verify(self.valid() + self.valid(primary=second), fingerprints=(self.FPR, second))
-        with self.assertRaises(apply.VerifyError):  # both have to be pinned
-            self.verify(self.valid() + self.valid(primary=second))
-
-    def test_a_missing_gpgv_is_reported_not_crashed_on(self):
-        def missing(argv, **kwargs):
-            raise FileNotFoundError("gpgv")
-        keyring = Path(tempfile.mkdtemp()) / "k.gpg"
-        keyring.write_bytes(b"x")
-        self.addCleanup(shutil.rmtree, keyring.parent)
-        with self.assertRaisesRegex(apply.VerifyError, "gpgv"):
-            apply.verify_signature(Path("s"), Path("s.asc"), keyring, (self.FPR,), run=missing)
 
 
 if __name__ == "__main__":

@@ -8,9 +8,9 @@ One file with two halves, because the second half runs as root from a private co
   so a bad download is refused before anyone is prompted;
 * the transaction: install, prove the machine is back, roll back if it is not.
 
-The release key is pinned twice: the keyring file the package ships, and the primary-key
-fingerprints below.  A signature counts only when gpgv, run with an empty home directory
-and that one keyring, reports a valid signature from a pinned primary key.
+What is believed is the release that github.com/GaryOAO/UUWay serves over https: the deb has to
+match the SHA-256 that the same release lists in SHA256SUMS, be the right package, and be newer.
+The checksum guards against a damaged or cut-off download; it is not a signature.
 """
 import argparse
 import collections
@@ -30,20 +30,10 @@ import tempfile
 import time
 import traceback
 
-# The keyring that the installed package ships.  It is read before dpkg replaces the tree,
-# so a package that rotates the key is still verified with the key that is already trusted.
-KEYRING = Path('/usr/lib/uuway/config/uuway-release.gpg')
-# Primary-key fingerprints of the release signing key (upper-case hex).  While this is
-# empty nothing is trusted, so an update can never install anything.
-TRUSTED_FINGERPRINTS = ()
-
 PACKAGE = 'uuway'
 ARCHITECTURE = 'amd64'
 TAG = re.compile(r'v((?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*))')
 SUMS_LINE = re.compile(r'([0-9a-f]{64})  ([A-Za-z0-9][A-Za-z0-9._+~-]*)')
-BAD_STATUS = ('BADSIG', 'EXPKEYSIG', 'REVKEYSIG', 'EXPSIG')
-MISSING_KEY = '9'  # the reason code in `ERRSIG`: the signing key is not in the keyring
-STRONG_HASHES = ('8', '9', '10')  # OpenPGP ids of SHA-256, SHA-384 and SHA-512
 
 Release = collections.namedtuple('Release', 'version deb sha256')
 
@@ -82,53 +72,6 @@ def parse_sums(text, name):
     return found[0]
 
 
-def verify_signature(sums, signature, keyring, fingerprints, *, run=subprocess.run):
-    """Raise VerifyError unless `signature` is a good signature over `sums` by a pinned key.
-
-    gpgv gets an empty home directory and the one keyring, so nothing the user (or an
-    attacker) put into their own GnuPG setup counts.  The verdict comes from gpgv's status
-    lines: an exit code alone says nothing about *whose* signature it was.
-    """
-    if not fingerprints:
-        raise VerifyError('程序里没有写入可信的发布密钥指纹，拒绝安装。')
-    if not Path(keyring).is_file():
-        raise VerifyError(f'找不到发布公钥 {keyring}，拒绝安装。')
-    with tempfile.TemporaryDirectory(prefix='uuway-gpgv-') as home:
-        try:
-            result = run(['gpgv', '--status-fd', '1', '--homedir', home,
-                          '--keyring', str(keyring), str(signature), str(sums)],
-                         capture_output=True, text=True, timeout=60, check=False)
-        except (OSError, subprocess.TimeoutExpired):
-            raise VerifyError('无法运行 gpgv，没法校验签名（需要软件包 gpgv）。')
-    valid, unknown = [], 0
-    for line in result.stdout.splitlines():
-        if not line.startswith('[GNUPG:] '):
-            continue
-        fields = line[len('[GNUPG:] '):].split()
-        if fields and fields[0] in BAD_STATUS:
-            raise VerifyError(f'签名校验失败（{fields[0]}）。')
-        if fields and fields[0] == 'ERRSIG':
-            # ERRSIG <keyid> <pk-algo> <hash-algo> <class> <time> <reason> <fpr>
-            if len(fields) < 7 or fields[6] != MISSING_KEY:
-                raise VerifyError('签名校验失败（ERRSIG：不是缺少公钥，而是别的原因）。')
-            unknown += 1  # a signature by a key this install does not know: see below
-        if fields and fields[0] == 'VALIDSIG':
-            valid.append(fields)
-    # While the release key is being replaced a release carries two signatures, and an install
-    # that still has only the old key cannot check the new one.  That is fine: what counts is
-    # that one signature is valid and from a pinned key.  gpgv then exits with 2 instead of 0.
-    if not valid or result.returncode not in ((0, 2) if unknown else (0,)):
-        raise VerifyError('签名校验失败：没有来自发布密钥的有效签名。')
-    trusted = {fingerprint.upper() for fingerprint in fingerprints}
-    for fields in valid:
-        # VALIDSIG <signing key> <date> <ts> <expiry> <ver> <rsvd> <pk-algo> <hash-algo> <class> <primary key>
-        primary = (fields[10] if len(fields) > 10 else fields[1]).upper()
-        if primary not in trusted:
-            raise VerifyError(f'签名来自没有写入程序的密钥（指纹 {primary}），拒绝安装。')
-        if len(fields) < 9 or fields[8] not in STRONG_HASHES:
-            raise VerifyError('签名使用了过弱的哈希算法，拒绝安装。')
-
-
 def version_is_newer(new, old, *, run=subprocess.run):
     result = run(['dpkg', '--compare-versions', new, 'gt', old],
                  capture_output=True, text=True, timeout=60, check=False)
@@ -149,29 +92,25 @@ def deb_control(deb, *, run=subprocess.run):
     return fields
 
 
-def check_signed_checksums(stage, tag, keyring, fingerprints, *, run=subprocess.run):
-    """The signature on SHA256SUMS and the checksum it lists for this release's deb.
+def check_checksums(stage, tag):
+    """The checksum that SHA256SUMS lists for this release's deb.
 
-    Needs only the two small files, so the updater can run it before the deb is downloaded.
+    Needs only the small file, so the updater can run it before the deb is downloaded.
     """
     stage = Path(stage)
     match = TAG.fullmatch(tag)
     if not match:
         raise VerifyError(f'发布标签（tag）必须形如 vX.Y.Z，收到的是 {tag!r}。')
-    sums, signature = stage / 'SHA256SUMS', stage / 'SHA256SUMS.asc'
-    for required in (sums, signature):
-        if not required.is_file():
-            what = '签名文件' if required == signature else '文件'
-            raise VerifyError(f'缺少{what} {required.name}（这个版本可能还没有签名）。')
-    verify_signature(sums, signature, keyring, fingerprints, run=run)
+    sums = stage / 'SHA256SUMS'
+    if not sums.is_file():
+        raise VerifyError(f'缺少文件 {sums.name}。')
     return parse_sums(sums.read_text(), deb_name(match.group(1)))
 
 
-def check_release(stage, tag, installed, keyring, fingerprints, *, run=subprocess.run):
+def check_release(stage, tag, installed, *, run=subprocess.run):
     """Verify a staged download; return a Release or raise VerifyError.
 
-    `stage` holds the deb, SHA256SUMS and SHA256SUMS.asc.  Order matters: the signature
-    first (nothing in an unsigned file is believed), then the checksum, then what the deb
+    `stage` holds the deb and SHA256SUMS.  Order matters: the checksum first, then what the deb
     says about itself, then that it really is newer than what is installed.
     """
     stage = Path(stage)
@@ -181,13 +120,12 @@ def check_release(stage, tag, installed, keyring, fingerprints, *, run=subproces
     version = match.group(1)
     name = deb_name(version)
     deb = stage / name
-    # The signature first, and before the deb is even looked for: nothing in an unsigned file is believed.
-    expected = check_signed_checksums(stage, tag, keyring, fingerprints, run=run)
+    expected = check_checksums(stage, tag)
     if not deb.is_file():
         raise VerifyError(f'缺少文件 {name}。')
     actual = sha256_file(deb)
     if actual != expected:
-        raise VerifyError(f'{name} 的 SHA-256 与已签名的 SHA256SUMS 不一致（哈希 {actual}），拒绝安装。')
+        raise VerifyError(f'{name} 的 SHA-256 与 SHA256SUMS 不一致（哈希 {actual}），拒绝安装。')
     control = deb_control(deb, run=run)
     if control.get('Package') != PACKAGE:
         raise VerifyError(f'deb 的软件包名是 {control.get("Package")!r}，不是 {PACKAGE}。')
@@ -613,9 +551,8 @@ def copy_private(source, target, limit):
 
 
 def copy_stage(job, stage, work):
-    """The three downloaded files, copied where only root can change them before they are checked."""
-    for name, limit in (('SHA256SUMS', SUMS_LIMIT), ('SHA256SUMS.asc', SUMS_LIMIT),
-                        (deb_name(job.version), DEB_LIMIT)):
+    """The two downloaded files, copied where only root can change them before they are checked."""
+    for name, limit in (('SHA256SUMS', SUMS_LIMIT), (deb_name(job.version), DEB_LIMIT)):
         copy_private(Path(stage) / name, Path(work) / name, limit)
 
 
@@ -899,7 +836,7 @@ def run_update(job, stage, *, verify=check_release):
     try:
         work = Path(tempfile.mkdtemp(prefix='stage-', dir=layout.work))
         copy_stage(job, stage, work)
-        release = verify(work, job.tag, installed, KEYRING, TRUSTED_FINGERPRINTS, run=job.check_run)
+        release = verify(work, job.tag, installed, run=job.check_run)
         # Moved, not copied: it was verified where only root can write, and a move leaves it as it was.
         for old in layout.new.iterdir():
             old.unlink()
@@ -908,7 +845,7 @@ def run_update(job, stage, *, verify=check_release):
         os.chmod(new, 0o644)
     except (VerifyError, OSError) as error:
         return finish_with(job, 'not_started', str(error))
-    log('签名、哈希和版本检查通过。')
+    log('哈希和版本检查通过。')
     try:
         built, previous_sha = repack_installed(job, installed)
     except (TransactionError, OSError) as error:

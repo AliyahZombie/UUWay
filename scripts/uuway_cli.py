@@ -1216,14 +1216,7 @@ def update_check(ctx, args):
     if is_newer(ctx, latest.version, installed):
         print(f'   {_paint("1;32", "有新版本")} {latest.version}（当前 {installed}，发布于 {latest.published[:10]}）')
         info(f'更新说明：{latest.url}')
-        try:
-            signed = uuway_update.release_is_signed(new_fetcher(), latest.tag)
-        except uuway_update.FetchError:
-            signed = None  # cannot be told: claim nothing either way
-        if signed is False:
-            warn('这个版本已经发布，但还没有签名，暂时不能用 uuway update 安装；等维护者签名后再试。')
-        else:
-            info('安装：uuway update install（安装时远程连接会断开几分钟，会自动检查并在不正常时回滚）')
+        info('安装：uuway update install（安装时远程连接会断开几分钟，会自动检查并在不正常时回滚）')
     else:
         ok(f'已是最新（{installed}）。')
     return 0
@@ -1395,8 +1388,8 @@ def update_install(ctx, args):
         raise SetupError('dpkg 处于未完成状态，先修好它：sudo dpkg --configure -a')
     source = getattr(args, 'source', None)
     if source:
-        # A rehearsal: a release laid out by hand in a directory (docs/release-signing.md), with no
-        # network. It is checked exactly like a download, against the key the package ships.
+        # A rehearsal: a release laid out by hand in a directory (the deb and its SHA256SUMS, see
+        # docs/design.md, "Updates"), with no network. It is checked exactly like a download.
         match = update_checks.TAG.fullmatch(getattr(args, 'tag', None) or '')
         if not match:
             raise SetupError('--source 要和 --tag vX.Y.Z 一起用。')
@@ -1415,7 +1408,7 @@ def update_install(ctx, args):
     command = apply_command('apply', tag=tag, stage=stage, user=getpass.getuser(), uid=os.getuid(), home=ctx.home,
                             prefix=ctx.prefix, snapshot='<更新前快照>', baseline=baseline_file, reboot=args.reboot_if_stuck)
     if ctx.dry_run:
-        info(f'（演练）会把 {installed} 更新到 {version}：下载并校验签名，备份，然后以 root 运行：')
+        info(f'（演练）会把 {installed} 更新到 {version}：下载并校验哈希，备份，然后以 root 运行：')
         print('   ' + _paint('2', '$ ' + ' '.join(ctx.elevate(command, terminal_first=True))))
         return 0
     update_recovery_layer(ctx, args)
@@ -1428,15 +1421,11 @@ def update_install(ctx, args):
             shutil.rmtree(ctx.state_dir / 'update', ignore_errors=True)
             uuway_update.download_release(
                 new_fetcher(), tag, stage,
-                before_deb=lambda staged: update_checks.check_signed_checksums(
-                    staged, tag, update_checks.KEYRING, update_checks.TRUSTED_FINGERPRINTS, run=subprocess.run))
-        release = update_checks.check_release(stage, tag, installed, update_checks.KEYRING,
-                                              update_checks.TRUSTED_FINGERPRINTS, run=subprocess.run)
-    except uuway_update.Unsigned as error:
-        raise SetupError(str(error))
+                before_deb=lambda staged: update_checks.check_checksums(staged, tag))
+        release = update_checks.check_release(stage, tag, installed, run=subprocess.run)
     except (uuway_update.FetchError, update_checks.VerifyError) as error:
         raise SetupError(str(error))
-    ok(f'已{"读取" if source else "下载"}并校验 {version}（签名和哈希都对得上）。')
+    ok(f'已{"读取" if source else "下载"}并校验 {version}（哈希对得上）。')
     check_disk_space(release.deb, ctx.state_dir)  # where the download and the snapshot live
     write_atomic(baseline_file, json.dumps(baseline).encode(), 0o600)
     snapshot = ensure_backup(ctx)
@@ -1583,7 +1572,7 @@ def build_parser():
     autologin.add_argument('action', choices=('on', 'off', 'status'))
     autologin.set_defaults(handler=command_autologin)
 
-    update = commands.add_parser('update', help='检查并安装 UUWay 的新版本（校验签名，不正常会自动回滚）')
+    update = commands.add_parser('update', help='检查并安装 UUWay 的新版本（不正常会自动回滚）')
     common(update)
     update.add_argument('action', nargs='?', choices=('check', 'install', 'status', 'rollback'), default='check',
                         help='check 查看有没有新版本（默认）；install 安装；status 看上次更新的结果；rollback 回到更新前的版本')

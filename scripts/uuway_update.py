@@ -5,7 +5,7 @@ The user's half of `uuway update`.  It runs unprivileged, so the user's own prox
 apply, and it believes as little as it can: the answer is only a tag name (checked against
 a strict pattern), every URL is built here from that tag instead of being copied from the
 answer, redirects may only lead to GitHub's own hosts, and each response has a size limit
-and a deadline.  What it downloads is not trusted either; uuway_update_apply decides that.
+and a deadline.  What it downloads is checked by uuway_update_apply before anything is installed.
 """
 import collections
 import http.client
@@ -26,7 +26,7 @@ DOWNLOAD_URL = f'https://github.com/{REPO}/releases/download/{{tag}}/{{name}}'
 RELEASE_PAGE = f'https://github.com/{REPO}/releases/tag/{{tag}}'
 ALLOWED_HOSTS = ('github.com', 'api.github.com')
 ALLOWED_SUFFIX = '.githubusercontent.com'  # where GitHub serves release assets from
-SMALL_LIMIT = 1 << 20  # the API answer, SHA256SUMS and its signature
+SMALL_LIMIT = 1 << 20  # the API answer and SHA256SUMS
 DEB_LIMIT = 300 << 20
 DEADLINE = 900  # seconds for everything one command downloads
 REQUEST_TIMEOUT = 30  # seconds without an answer from one request
@@ -45,10 +45,6 @@ class NotFound(FetchError):
 
 class NotModified(Exception):
     """The cached answer is still the newest one."""
-
-
-class Unsigned(Exception):
-    """The release is published but carries no signature, so it cannot be installed."""
 
 
 def host_allowed(url):
@@ -207,23 +203,11 @@ def latest_release(fetcher, etag=None):
                   headers.get('etag'), RELEASE_PAGE.format(tag=tag))
 
 
-def release_is_signed(fetcher, tag):
-    """Whether the release already carries its signature; FetchError when that cannot be told."""
-    match = checks.TAG.fullmatch(tag)
-    if not match:
-        raise FetchError(f'发布标签（tag）必须形如 vX.Y.Z，收到的是 {tag!r}。')
-    try:
-        fetcher.get(DOWNLOAD_URL.format(tag=tag, name='SHA256SUMS.asc'), SMALL_LIMIT)
-    except NotFound:
-        return False
-    return True
-
-
 def download_release(fetcher, tag, dest, before_deb=None):
-    """Fetch the deb, SHA256SUMS and SHA256SUMS.asc of `tag` into `dest` (created 0700).
+    """Fetch SHA256SUMS and the deb of `tag` into `dest` (created 0700).
 
-    `before_deb(dest)` runs once the two small files are there and before the deb is fetched, so a
-    release that cannot be trusted costs a kilobyte instead of the whole download.
+    `before_deb(dest)` runs once SHA256SUMS is there and before the deb is fetched, so a release
+    that is not laid out as expected costs a kilobyte instead of the whole download.
     """
     match = checks.TAG.fullmatch(tag)
     if not match:
@@ -231,15 +215,11 @@ def download_release(fetcher, tag, dest, before_deb=None):
     dest = Path(dest)
     dest.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(dest, 0o700)
-    # The signature first: an unsigned release is reported before a megabyte is downloaded.
-    for name, limit in (('SHA256SUMS.asc', SMALL_LIMIT), ('SHA256SUMS', SMALL_LIMIT),
-                        (checks.deb_name(match.group(1)), DEB_LIMIT)):
+    for name, limit in (('SHA256SUMS', SMALL_LIMIT), (checks.deb_name(match.group(1)), DEB_LIMIT)):
         if name == checks.deb_name(match.group(1)) and before_deb is not None:
             before_deb(dest)
         try:
             fetcher.save(DOWNLOAD_URL.format(tag=tag, name=name), dest / name, limit)
         except NotFound:
-            if name == 'SHA256SUMS.asc':
-                raise Unsigned(f'{tag} 已发布，但还没有签名，不能安装。') from None
             raise FetchError(f'{tag} 缺少 {name}。') from None
     return dest

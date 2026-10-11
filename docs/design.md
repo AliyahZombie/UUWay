@@ -173,12 +173,16 @@ from UU's own remote terminal, and an update restarts the service that terminal 
   anyway. The unit is started with one authorization, in the terminal (sudo), because later nobody can
   answer a polkit dialog: a shell opened through UU's terminal inherits `DISPLAY`, so `pkexec` would put
   its dialog on a desktop nobody is watching.
-- **It trusts only a signed release.** The checks (`uuway_update_apply.py`, first half) run twice: as
-  the user before anything is asked, and as root on a copy that only root can change. A release counts
-  when `SHA256SUMS` has a valid detached signature from a pinned primary key (gpgv, empty home, one
-  keyring, verdict from the status lines), the deb matches the signed hash, says it is `uuway`/`amd64`
-  at the version in the tag, and that version is newer than the installed one. See
-  `docs/release-signing.md`.
+- **It installs what the project's GitHub release serves.** There is no release signature or key: the
+  release is fetched only from `github.com/GaryOAO/UUWay` over https (redirects may lead only to
+  GitHub's own hosts), so whoever controls that repository's releases controls what installs. The
+  checks (`uuway_update_apply.py`, first half) run twice: as the user before anything is asked, and as
+  root on a copy that only root can change. A release counts when the deb matches the SHA-256 that the
+  same release lists in `SHA256SUMS` (this catches a damaged or cut-off download, it is not
+  authentication), says it is `uuway`/`amd64` at the version in the tag, and that version is newer
+  than the installed one. To rehearse without the network, lay a deb and its `SHA256SUMS` out in a
+  directory and run `uuway update install --source DIR --tag vX.Y.Z` (an option that is not listed in
+  `--help`).
 - **It can go back.** Before installing, the installed package is rebuilt as a deb from the files on
   disk, so a rollback needs neither the old release nor the network. The user's configuration is
   snapshotted too: the old installer refuses configuration it does not recognise, so a rollback restores

@@ -3,15 +3,15 @@
 
     update-e2e.py /path/uuway_X_amd64.deb      (as root, with that package installed)
 
-dpkg, apt-get, dpkg-deb and gpgv are the real ones.  What a container cannot have is
+dpkg, apt-get and dpkg-deb are the real ones.  What a container cannot have is
 stood in for: the desktop session and the user's systemd services (so "is the machine
 back?" is scripted) and the clock (so waiting costs nothing).  It runs the installed copy
-of uuway_update_apply.py with a throwaway signing key in place of the release key.
+of uuway_update_apply.py.
 
-Checked: a newer signed version is installed; a tampered, unsigned, replayed, downgraded
-or wrongly signed release is refused before anything changes; an update after which the
-machine is not healthy is rolled back to the version before it, with dpkg left clean and
-every file back as it was.
+Checked: a newer version is installed; a tampered, replayed, mislabelled or downgraded
+release is refused before anything changes; an update after which the machine is not
+healthy is rolled back to the version before it, with dpkg left clean and every file back
+as it was.
 """
 import hashlib
 import importlib.util
@@ -24,7 +24,6 @@ import sys
 import tempfile
 
 LIB = Path('/usr/lib/uuway')
-KEYRING = LIB / 'config/uuway-release.gpg'
 spec = importlib.util.spec_from_file_location('uuway_update_apply', LIB / 'scripts/uuway_update_apply.py')
 apply = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(apply)
@@ -128,19 +127,7 @@ baseline = dict(units={name: dict(active=True, restarts=0, entered=500) for name
                 processes={}, connected=None)
 
 
-def make_key(name):
-    home = work / f'gnupg-{name}'
-    home.mkdir(mode=0o700)
-    base = ['gpg', '--homedir', home, '--batch', '--pinentry-mode', 'loopback', '--passphrase', '']
-    run(*base, '--quick-generate-key', f'{name} <{name}@example.invalid>', 'ed25519', 'sign', 'never')
-    listing = run(*base, '--with-colons', '--list-keys').stdout
-    fingerprint = next(line.split(':')[9] for line in listing.splitlines() if line.startswith('fpr:'))
-    keyring = work / f'{name}.gpg'
-    keyring.write_bytes(subprocess.run(['gpg', '--homedir', str(home), '--export'], capture_output=True, check=True).stdout)
-    return base, fingerprint, keyring
-
-
-def make_release(version, base, *, source_deb, deb_version=None, tamper=False, sign=True, sums_for=None):
+def make_release(version, *, source_deb, deb_version=None, tamper=False, sums=True, sums_for=None):
     """A staged release as the updater downloads it, built by repacking `source_deb`."""
     tree = work / f'tree-{version}-{len(list(work.iterdir()))}'
     run('dpkg-deb', '-R', source_deb, tree)
@@ -153,9 +140,8 @@ def make_release(version, base, *, source_deb, deb_version=None, tamper=False, s
     run('dpkg-deb', '--root-owner-group', '-Zgzip', '-z1', '-b', tree, deb)
     shutil.rmtree(tree)
     name = apply.deb_name(sums_for or version)
-    (stage / 'SHA256SUMS').write_text(f'{hashlib.sha256(deb.read_bytes()).hexdigest()}  {name}\n')
-    if sign:
-        run(*base, '--yes', '--armor', '--detach-sign', '-o', stage / 'SHA256SUMS.asc', stage / 'SHA256SUMS')
+    if sums:
+        (stage / 'SHA256SUMS').write_text(f'{hashlib.sha256(deb.read_bytes()).hexdigest()}  {name}\n')
     if tamper:
         with deb.open('ab') as handle:
             handle.write(b'x')
@@ -171,31 +157,19 @@ def update(tag, stage):
 
 
 def scenarios(original):
-    base, fingerprint, test_keyring = make_key('release')
-    other_base, _, _ = make_key('intruder')
-    apply.TRUSTED_FINGERPRINTS = (fingerprint,)
-
-    def trust_the_test_key():
-        # The package that is installed ships the real key; the test signs with its own.
-        KEYRING.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(test_keyring, KEYRING)
-
     start = installed_version()
     print(f'  installed: uuway {start}')
-    trust_the_test_key()
 
-    print('\n── refused before anything changes (real gpgv, real dpkg-deb)')
+    print('\n── refused before anything changes (real dpkg-deb)')
     refusals = (
-        ('a deb changed after it was signed', '99.0.0', dict(tamper=True)),
-        ('a release without a signature', '99.0.0', dict(sign=False)),
-        ('a release signed with some other key', '99.0.0', dict(base=other_base)),
-        ('an old signed release replayed under a newer tag', '99.0.0', dict(sums_for='98.0.0')),
+        ('a deb changed after its checksum was written', '99.0.0', dict(tamper=True)),
+        ('a release without SHA256SUMS', '99.0.0', dict(sums=False)),
+        ('a checksum that is listed for another version', '99.0.0', dict(sums_for='98.0.0')),
         ('a deb whose own version is not the tag', '99.0.0', dict(deb_version='99.0.1')),
         ('a version that is not newer than the installed one', '0.0.1', {}),
     )
     for name, version, options in refusals:
-        options = dict(options)
-        stage = make_release(version, options.pop('base', base), source_deb=original, **options)
+        stage = make_release(version, source_deb=original, **options)
         staged_before = sorted(Path('/var/lib/uuway/update/new').glob('*'))
         outcome, result = update(f'v{version}', stage)
         check(f'{name} is refused', outcome == 'not_started' and installed_version() == start and dpkg_clean(),
@@ -203,8 +177,8 @@ def scenarios(original):
         check(f'  and nothing was staged for apt: {name}',
               sorted(Path('/var/lib/uuway/update/new').glob('*')) == staged_before)
 
-    print('\n── a newer signed version is installed')
-    stage = make_release('99.0.0', base, source_deb=original)
+    print('\n── a newer version is installed')
+    stage = make_release('99.0.0', source_deb=original)
     outcome, result = update('v99.0.0', stage)
     check('the update succeeds', outcome == 'success', result)
     check('the new version is installed and dpkg is clean', installed_version() == '99.0.0' and dpkg_clean())
@@ -219,14 +193,13 @@ def scenarios(original):
     check('no resume unit is left behind', not Path('/etc/systemd/system/uuway-update-resume.service').exists())
 
     print('\n── an update after which the machine is not healthy is rolled back')
-    trust_the_test_key()  # installing 99.0.0 brought the real key back
     runner.unhealthy.add('99.0.1')
-    stage = make_release('99.0.1', base, source_deb=original)
+    stage = make_release('99.0.1', source_deb=original)
     outcome, result = update('v99.0.1', stage)
     check('it is rolled back', outcome == 'rolled_back', result)
     check('the version before the update is installed again', installed_version() == '99.0.0', installed_version())
     check('dpkg is left clean', dpkg_clean(), run('dpkg', '--audit', check=False).stdout)
-    changed = [line for line in run('dpkg', '-V', 'uuway', check=False).stdout.splitlines() if 'uuway-release.gpg' not in line]
+    changed = run('dpkg', '-V', 'uuway', check=False).stdout.splitlines()
     check('every installed file is as the package says (md5sums)', not changed, '\n'.join(changed))
     check('the result says so', (result or {}).get('outcome') == 'rolled_back' and (result or {}).get('rolled_back_to') == '99.0.0', result)
     check('no resume unit is left behind', not Path('/etc/systemd/system/uuway-update-resume.service').exists())
@@ -235,20 +208,9 @@ def scenarios(original):
 
 
 def main(original):
-    """Run the scenarios, then put the release keyring back as it was.
-
-    The test swaps in its own key.  Until the package ships a release key the file is not the
-    package's, so dpkg would leave it (and the directory around it) behind on removal.
-    """
-    had_keyring = KEYRING.exists()
-    saved = KEYRING.read_bytes() if had_keyring else b''
     try:
         return scenarios(original)
     finally:
-        if had_keyring:
-            KEYRING.write_bytes(saved)
-        else:
-            KEYRING.unlink(missing_ok=True)
         shutil.rmtree(work, ignore_errors=True)
 
 

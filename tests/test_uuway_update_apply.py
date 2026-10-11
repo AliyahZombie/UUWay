@@ -235,8 +235,7 @@ class UpdateCase(unittest.TestCase):
                              connected=True)
         self.stage = self.root / "stage"
         self.stage.mkdir()
-        for name, data in (("SHA256SUMS", b"sums"), ("SHA256SUMS.asc", b"sig"),
-                           ("uuway_1.2.1_amd64.deb", b"new package")):
+        for name, data in (("SHA256SUMS", b"sums"), ("uuway_1.2.1_amd64.deb", b"new package")):
             (self.stage / name).write_bytes(data)
 
         def repack(job, version):
@@ -244,7 +243,7 @@ class UpdateCase(unittest.TestCase):
             built.write_bytes(b"previous package")
             return built, hashlib.sha256(b"previous package").hexdigest()
 
-        def verify(work, tag, installed, keyring, fingerprints, *, run):
+        def verify(work, tag, installed, *, run):
             self.verified = (tag, installed)
             deb = work / apply.deb_name(tag[1:])
             return apply.Release(tag[1:], deb, hashlib.sha256(deb.read_bytes()).hexdigest())
@@ -271,7 +270,7 @@ class UpdateCase(unittest.TestCase):
     def stage_for(self, version):
         stage = self.root / f"stage-{version}"
         stage.mkdir()
-        for name, data in (("SHA256SUMS", b"sums"), ("SHA256SUMS.asc", b"sig"), (f"uuway_{version}_amd64.deb", b"pkg " + version.encode())):
+        for name, data in (("SHA256SUMS", b"sums"), (f"uuway_{version}_amd64.deb", b"pkg " + version.encode())):
             (stage / name).write_bytes(data)
         return stage
 
@@ -376,11 +375,11 @@ class RefusedBeforeAnythingChangesTests(UpdateCase):
 
     def test_a_failed_verification_stops_everything(self):
         def refuse(*args, **kwargs):
-            raise apply.VerifyError("签名校验失败")
+            raise apply.VerifyError("哈希校验失败")
         outcome = apply.run_update(self.job(), self.stage, verify=refuse)
         self.assertEqual(outcome, "not_started")
         self.assert_nothing_installed()
-        self.assertIn("签名校验失败", self.result()["message"])
+        self.assertIn("哈希校验失败", self.result()["message"])
         self.assertFalse(self.machine.ran("dpkg-deb"))  # nothing was repacked either
 
     def test_no_installed_package_means_nothing_to_update(self):
@@ -601,7 +600,7 @@ class RollbackTargetTests(UpdateCase):
         self.succeed_once()
 
         def refuse(*args, **kwargs):
-            raise apply.VerifyError("签名校验失败")
+            raise apply.VerifyError("哈希校验失败")
         outcome = apply.run_update(self.job(tag="v1.2.2"), self.stage_for("1.2.2"), verify=refuse)
         self.assertEqual(outcome, "not_started")
         self.assert_old_target_survives()
@@ -615,7 +614,7 @@ class RollbackTargetTests(UpdateCase):
 
     def test_a_first_attempt_that_is_refused_has_nothing_to_roll_back_to(self):
         def refuse(*args, **kwargs):
-            raise apply.VerifyError("签名校验失败")
+            raise apply.VerifyError("哈希校验失败")
         apply.run_update(self.job(), self.stage, verify=refuse)
         self.assertIsNone(self.result()["rollback_to"])
         self.assertFalse(self.layout.journal.exists())
