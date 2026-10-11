@@ -98,6 +98,21 @@ own pseudoconsole ends clients immediately when `PSEUDOCONSOLE_INHERIT_CURSOR` i
    (full-screen programs repaint; a plain shell reprints its prompt). A resize frame with an
    out-of-range size is ignored rather than treated as a protocol error, because a controller can
    send one transiently while its terminal window initializes.
+4. **Removes OSC 3008 from the shell's output.** Ubuntu 26.04 (systemd 258 and later) ships
+   `/etc/profile.d/80-systemd-osc-context.sh`, which makes every interactive bash print
+   `ESC ] 3008 ; start=… ESC \` and `ESC ] 3008 ; end=… ESC \` around each prompt and command
+   (UAPI.15 "hierarchical context signalling"). UU's terminal does not know the sequence and shows
+   it as text, on the PC and on the phone. The broker drops these strings before they reach the
+   viewer (`src/terminal_osc_filter.h`), the way a terminal drops an OSC string it does not know,
+   and passes every other sequence through. The filter is a small state machine because a sequence
+   can be split across two reads of the PTY. It follows the usual rules for an OSC string: ST or
+   BEL ends it; an ESC followed by anything else, a control character, or a string longer than
+   8 KiB cancels it and the rest is ordinary output, so a damaged sequence cannot swallow the
+   session. Up to six bytes that could still turn out to be the start of a sequence are held back
+   and released as soon as the shell goes quiet for 20 ms.
+   The sequence is only printed by bash. To stop it at the source instead, remove the symlink
+   `/etc/profile.d/80-systemd-osc-context.sh` and mask its tmpfiles snippet
+   (`ln -s /dev/null /etc/tmpfiles.d/20-systemd-osc-context.conf`), as the script itself documents.
 
 ## Clipboard
 

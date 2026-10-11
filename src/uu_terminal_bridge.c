@@ -24,6 +24,7 @@
 #include <unistd.h>
 
 #include "terminal_bridge_protocol.h"
+#include "terminal_osc_filter.h"
 
 /* Connection handlers plus persistent session holders. */
 #define MAX_SESSIONS 32
@@ -33,6 +34,8 @@
 #define IO_TIMEOUT_MS 5000
 #define POLL_SLICE_MS 100
 #define REDRAW_DELAY_MS 800
+/* How long output held back by the OSC filter may wait for its next byte. */
+#define OSC_HOLD_MS 20
 
 static volatile sig_atomic_t stop_requested;
 static volatile sig_atomic_t children_changed;
@@ -172,6 +175,29 @@ static int send_all(int fd, const void *buffer, size_t size)
         size -= (size_t)sent;
     }
     return 1;
+}
+
+/* Shell output for the viewer, minus the OSC 3008 context signalling that
+ * UU's terminal would show as text (terminal_osc_filter.h). With no viewer
+ * (`viewer` < 0) the output is dropped, but still goes through the filter so
+ * that it keeps track of a sequence that is split across reads. */
+static int forward_output(int viewer, struct uurb_osc_filter *filter,
+                          const unsigned char *data, size_t size)
+{
+    static unsigned char filtered[UURB_TERMINAL_MAX_FRAME + UURB_OSC_FILTER_HELD_MAX];
+    const size_t kept = uurb_osc_filter_run(filter, data, size, filtered);
+
+    return kept == 0 || viewer < 0 || send_all(viewer, filtered, kept);
+}
+
+/* The shell went quiet: whatever the filter was holding back was not the start
+ * of a sequence after all (or its end is not coming). */
+static int release_held_output(int viewer, struct uurb_osc_filter *filter)
+{
+    unsigned char held[UURB_OSC_FILTER_HELD_MAX];
+    const size_t size = uurb_osc_filter_flush(filter, held);
+
+    return size == 0 || viewer < 0 || send_all(viewer, held, size);
 }
 
 static void stop_shell(pid_t child)
@@ -390,6 +416,7 @@ static int relay_transient(int client, struct winsize initial_size)
 {
     struct pollfd descriptors[2];
     unsigned char payload[UURB_TERMINAL_MAX_FRAME];
+    struct uurb_osc_filter filter = {0};
     pid_t shell_pid;
     int pty_master = -1;
     int status;
@@ -418,18 +445,22 @@ static int relay_transient(int client, struct winsize initial_size)
             result = 0;
             break;
         }
-        ready = poll(descriptors, 2, 500);
+        ready = poll(descriptors, 2, uurb_osc_filter_holding(&filter) ? OSC_HOLD_MS : 500);
         if (ready < 0) {
             if (errno == EINTR)
                 continue;
             break;
         }
+        if (uurb_osc_filter_holding(&filter) &&
+            !(ready > 0 && (descriptors[1].revents & POLLIN)) &&
+            !release_held_output(client, &filter))
+            break;
         if (ready == 0)
             continue;
         if (descriptors[1].revents & POLLIN) {
             ssize_t size = read(pty_master, payload, sizeof(payload));
 
-            if (size <= 0 || !send_all(client, payload, (size_t)size))
+            if (size <= 0 || !forward_output(client, &filter, payload, (size_t)size))
                 break;
         }
         if ((descriptors[0].revents & POLLIN) &&
@@ -549,6 +580,7 @@ static int hold_session(int listener, int client, const struct handshake *handsh
     struct pollfd descriptors[3 + MAX_ANCHORS];
     unsigned char payload[UURB_TERMINAL_MAX_FRAME];
     struct winsize size = handshake->size;
+    struct uurb_osc_filter filter = {0};
     int anchors[MAX_ANCHORS];
     int anchor_count = 0;
     int anchored = 0;
@@ -584,12 +616,18 @@ static int hold_session(int listener, int client, const struct handshake *handsh
             descriptors[count++] = (struct pollfd){.fd = attach, .events = POLLIN};
         for (index = 0; index < anchor_count; index++)
             descriptors[count++] = (struct pollfd){.fd = anchors[index], .events = POLLIN};
-        ready = poll(descriptors, (nfds_t)count, redraw_at != 0 ? 100 : 500);
+        ready = poll(descriptors, (nfds_t)count,
+                     uurb_osc_filter_holding(&filter) ? OSC_HOLD_MS
+                                                      : (redraw_at != 0 ? 100 : 500));
         if (ready < 0) {
             if (errno == EINTR)
                 continue;
             break;
         }
+        if (uurb_osc_filter_holding(&filter) &&
+            !(ready > 0 && (descriptors[1].revents & POLLIN)) &&
+            !release_held_output(attach, &filter))
+            close_fd(&attach);
         /* A viewer may miss output sent before UU finished opening it; ask
          * for one more redraw shortly after every attach. */
         if (redraw_at != 0 && attach >= 0 && monotonic_milliseconds() >= redraw_at) {
@@ -608,7 +646,7 @@ static int hold_session(int listener, int client, const struct handshake *handsh
             if (received <= 0)
                 break;
             /* No viewer: output is dropped, as with dtach. */
-            if (attach >= 0 && !send_all(attach, payload, (size_t)received))
+            if (!forward_output(attach, &filter, payload, (size_t)received))
                 close_fd(&attach);
         }
         if (attach >= 0 && descriptors[2].fd == attach && descriptors[2].revents) {

@@ -8,6 +8,7 @@
 - **只在你运行时联网。** `uuway update` 只在你运行它的时候访问 `api.github.com` 和 `github.com`，不会在后台检查，不会自动安装。
 - **从 1.1.x 升到 1.2.0 要手动**（`sudo apt install ./uuway_1.2.0_amd64.deb`，再 `uuway refresh`）：1.2.0 是第一个能自己更新的版本。
 - **修复：在 UU 远程终端里运行 `uuway setup --system`、`uuway autologin on` 时，授权窗口弹到没人的桌面上。** 现在在 UU 终端或 SSH 里改为在当前终端里问 sudo 密码；在本机桌面前仍然弹出授权窗口。
+- **修复：Ubuntu 26.04 上，UU 终端里每个提示符前后都出现乱码。** 26.04（systemd 258 起）会让每个交互式 bash 在提示符和命令前后输出 OSC 3008 上下文序列（`ESC]3008;start=…`），UU 的终端不认识它，直接显示成文字，电脑和手机上都有。现在桥接服务在把 shell 的输出交给 UU 之前去掉这类序列，其他终端序列原样放行；序列被拆在两次读取之间也能去掉，残缺的序列不会吞掉后面的输出。Ubuntu 24.04 和 25.10 不带这个脚本，不受影响（[#2](https://github.com/GaryOAO/UUWay/issues/2)）。已在 Ubuntu 26.04 / 25.10 的干净容器里验证过输出，还没有在真实的 UU 客户端上看过。感谢 [@dororo42](https://github.com/dororo42) 发现并报告。
 
 ### 1.1.2 更新
 

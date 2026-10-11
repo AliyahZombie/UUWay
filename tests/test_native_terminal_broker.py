@@ -324,3 +324,83 @@ class PersistentTerminalSessionTests(NativeTerminalBrokerTests):
         port = self.start()
         for name in ("", ".hidden", "a/b", "x" * 65):
             self.assertIsNone(self.connect(port, self.ATTACH, name), name)
+
+    # Ubuntu 26.04 (systemd 258+) makes every interactive bash print OSC 3008 around each prompt and
+    # command, and UU's terminal shows it as text (reported on issue #2). The broker removes it.
+    OSC_3008 = b"\x1b]3008;"
+
+    def viewer(self, port, version):
+        if version == 2:
+            client = self.connect(port, self.ATTACH, "osc")
+            self.assertIsNotNone(client)
+            return client
+        client = socket.create_connection(("127.0.0.1", port), timeout=5)
+        client.sendall(self.hello() + self.token.encode())
+        self.assertEqual(client.recv(1), b"\x06")
+        return client
+
+    def output_of(self, client, command):
+        # The quotes keep the echoed command line from matching the marker.
+        self.send_input(client, command + b"; printf 'DONE''MARK\\n'\n")
+        received = self.read_until(client, b"DONEMARK")
+        self.assertIn(b"DONEMARK", received)
+        return received
+
+    def test_context_signalling_is_removed_from_the_output(self):
+        port = self.start()
+        for version in (1, 2):
+            with self.subTest(protocol=version):
+                client = self.viewer(port, version)
+                received = self.output_of(
+                    client, rb"printf 'BEFORE\033]3008;start=abc;type=shell;cwd=/tmp\033\\AFTER\n'")
+                self.assertIn(b"BEFOREAFTER", received)
+                received = self.output_of(
+                    client, rb"printf 'ONE\033]3008;end=abc;exit=success\007TWO\n'")
+                self.assertIn(b"ONETWO", received)
+                self.assertNotIn(self.OSC_3008, received)
+                client.close()
+
+    def test_other_escape_sequences_pass_through_untouched(self):
+        port = self.start()
+        for version in (1, 2):
+            with self.subTest(protocol=version):
+                client = self.viewer(port, version)
+                received = self.output_of(
+                    client, rb"printf 'KEEP\033]0;a title\007\033[31mred\033[0m\033]7;file:///tmp\033\\\n'")
+                self.assertIn(b"KEEP\x1b]0;a title\x07\x1b[31mred\x1b[0m\x1b]7;file:///tmp\x1b\\", received)
+                client.close()
+
+    def test_context_signalling_split_across_reads_is_removed(self):
+        port = self.start()
+        for version in (1, 2):
+            with self.subTest(protocol=version):
+                client = self.viewer(port, version)
+                received = self.output_of(
+                    client,
+                    rb"printf 'SPLIT1\033]3008;start=a'; sleep 0.3; printf ';type=shell\033'; "
+                    rb"sleep 0.3; printf '\\SPLIT2\n'")
+                self.assertIn(b"SPLIT1SPLIT2", received)
+                self.assertNotIn(self.OSC_3008, received)
+                client.close()
+
+    def test_output_held_back_is_released_when_the_shell_goes_quiet(self):
+        # "ESC ] 3 0" could be the start of a sequence; if nothing follows, it must still arrive.
+        port = self.start()
+        for version in (1, 2):
+            with self.subTest(protocol=version):
+                client = self.viewer(port, version)
+                self.send_input(client, rb"printf 'HELD\033]30'; sleep 2" + b"\n")
+                # Well before the sleep ends, so the bytes came from the idle release.
+                self.assertIn(b"HELD\x1b]30", self.read_until(client, b"HELD\x1b]30", 1.2))
+                client.close()
+
+    def test_damaged_context_signalling_does_not_swallow_the_session(self):
+        port = self.start()
+        for version in (1, 2):
+            with self.subTest(protocol=version):
+                client = self.viewer(port, version)
+                received = self.output_of(client, rb"printf 'LOST\033]3008;start=a\nKEPT\n'")
+                self.assertIn(b"LOST", received)
+                self.assertIn(b"KEPT", received)
+                self.assertNotIn(self.OSC_3008, received)
+                client.close()
