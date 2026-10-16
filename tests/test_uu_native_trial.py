@@ -15,6 +15,17 @@ spec.loader.exec_module(trial)
 
 
 class CleanupTests(unittest.TestCase):
+    def test_amd_gui_uses_real_display_and_other_launches_keep_virtual_display(self):
+        geometry = dict(width=1920, height=1080)
+        for backend, env, virtual in [('amd-vaapi', {'DISPLAY': ':0'}, False),
+                                      ('amd-vaapi', {}, True),
+                                      ('nvidia-nvenc', {'DISPLAY': ':0'}, True),
+                                      (None, {'DISPLAY': ':0'}, True)]:
+            with self.subTest(backend=backend, env=env):
+                command = trial.wine_launch_command({'encoder_backend': backend}, env, ['app.exe'], geometry)
+                self.assertEqual(command[-2:], [trial.WINE, 'app.exe'])
+                self.assertEqual(command[0] == 'xvfb-run', virtual)
+
     def test_deferred_ime_allows_only_missing_exact_private_endpoint(self):
         with tempfile.TemporaryDirectory() as name:
             parent = Path(name); endpoint = parent / 'ime.sock'

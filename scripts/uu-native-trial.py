@@ -43,6 +43,16 @@ def event(name, **values):
     print(json.dumps(dict(event=name, **values)), flush=True)
 
 
+def wine_launch_command(verified, env, arguments, geometry):
+    command = [WINE, *arguments]
+    # AMD's account/settings window belongs on the user's actual desktop.
+    # Capture remains controlled by the authorized Wayland portal.
+    if verified.get('encoder_backend') != 'amd-vaapi' or not env.get('DISPLAY'):
+        screen = f"--server-args=-screen 0 {geometry['width']}x{geometry['height']}x24 -nolisten tcp"
+        command = ['xvfb-run', '-a', screen, *command]
+    return command
+
+
 # Worst-case cleanup is a chain of Wine helper waits far longer than the unit's
 # WatchdogSec, so a supervised worker keeps the watchdog fed while it cleans up.
 # The beat is bounded (TimeoutStopSec): a truly wedged cleanup is still killed.
@@ -720,9 +730,9 @@ def run(prefix, bundle, restore_state, state_parent, duration, with_input=False,
             if is_stopping():
                 return
             geometry = topology['modes'][0] if topology else dict(width=1920, height=1080)
-            screen = f"--server-args=-screen 0 {geometry['width']}x{geometry['height']}x24 -nolisten tcp"
-            launcher = subprocess.Popen(['xvfb-run', '-a', screen,
-                WINE, *arguments], env=env, cwd=app, stdout=wine_log, stderr=wine_log, start_new_session=True)
+            command = wine_launch_command(verified, env, arguments, geometry)
+            launcher = subprocess.Popen(command, env=env, cwd=app, stdout=wine_log,
+                                        stderr=wine_log, start_new_session=True)
             event('native_runtime_started' if continuous else 'native_trial_started', state_directory=str(directory), release_id=verified['release_id'],
                   uu_session_tested=False, capture_cursor_mode=cursor_mode)
             deadline = float('inf') if continuous else time.monotonic() + duration
