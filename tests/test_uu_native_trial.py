@@ -2,6 +2,7 @@ import importlib.util
 import copy
 import os
 import socket
+import shutil
 import subprocess
 from pathlib import Path
 import tempfile
@@ -15,16 +16,18 @@ spec.loader.exec_module(trial)
 
 
 class CleanupTests(unittest.TestCase):
-    def test_amd_gui_uses_real_display_and_other_launches_keep_virtual_display(self):
-        geometry = dict(width=1920, height=1080)
-        for backend, env, virtual in [('amd-vaapi', {'DISPLAY': ':0'}, False),
-                                      ('amd-vaapi', {}, True),
-                                      ('nvidia-nvenc', {'DISPLAY': ':0'}, True),
-                                      (None, {'DISPLAY': ':0'}, True)]:
-            with self.subTest(backend=backend, env=env):
-                command = trial.wine_launch_command({'encoder_backend': backend}, env, ['app.exe'], geometry)
-                self.assertEqual(command[-2:], [trial.WINE, 'app.exe'])
-                self.assertEqual(command[0] == 'xvfb-run', virtual)
+    @unittest.skipUnless(shutil.which('xvfb-run'), 'requires Xvfb')
+    def test_runtime_keeps_wine_on_a_separate_display_for_clipboard_files(self):
+        # Exercise the actual launcher, including an inherited desktop DISPLAY.
+        # A real desktop launch would make clipboard discover() reject the pair.
+        with patch.object(trial, 'WINE', '/usr/bin/python3'):
+            command = trial.wine_launch_command(
+                ['-c', 'import os; print(os.environ["DISPLAY"])'],
+                dict(width=640, height=360))
+        result = subprocess.run(command, env=dict(os.environ, DISPLAY=':9876'),
+                                capture_output=True, text=True, check=True, timeout=10)
+        self.assertTrue(result.stdout.strip().startswith(':'))
+        self.assertNotEqual(result.stdout.strip(), ':9876')
 
     def test_deferred_ime_allows_only_missing_exact_private_endpoint(self):
         with tempfile.TemporaryDirectory() as name:

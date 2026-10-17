@@ -54,6 +54,7 @@ UPDATE_RESUME_UNIT = 'uuway-update-resume'  # the one-shot that finishes an upda
 UPDATE_STALE_DAYS = 14
 SERVICE_MARKER = '# Managed by UURB native installer;'
 DESKTOP_MARKER = '# Managed by UUWay console installer'
+AMD_DESKTOP_MARKER = '# Managed by UUWay AMD\n'
 FCITX_MARKER = '# Managed by uuway setup'
 HELPERS = ('uu-clipboard-bridge', 'uu-clipboard-files.exe', 'uu-conpty.dll',
            'uu-terminal-bridge', 'uu-terminal-proxy.exe')
@@ -408,7 +409,9 @@ def open_uu(ctx):
     executable = r'C:\Program Files\Netease\GameViewer\GameViewer.exe'
     env = ctx.wine_env()
     argv = [str(wine), executable]
-    if amd_backend_enabled() and not unit_active(ctx, 'uu-native-bridge'):
+    if amd_backend_enabled():
+        if unit_active(ctx, 'uu-native-bridge'):
+            raise SetupError('UU 后台运行在独立显示中，无法在桌面打开它的窗口。需要重新登录时请运行 uuway-amd setup --login。')
         stage = ctx.state_dir / 'login-support'
         if not ctx.dry_run:
             stage.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -784,7 +787,7 @@ def consent_run(ctx):
 # --------------------------------------------------------------------- step: launchers
 
 def amd_launcher_text():
-    return ('# Managed by UUWay AMD\n[Desktop Entry]\nType=Application\nName=UU远程\n'
+    return (AMD_DESKTOP_MARKER + '[Desktop Entry]\nType=Application\nName=UU远程\n'
             f'Exec=/bin/bash "{ROOT / "scripts/uuway-amd.sh"}" open\n'
             'Icon=024B_GameViewer.0\nStartupWMClass=gameviewer.exe\nTerminal=false\n')
 
@@ -796,10 +799,34 @@ def amd_launcher_targets(ctx):
         if not path.is_file() or path.is_symlink():
             continue
         text = path.read_text()
-        if text.startswith('# Managed by UUWay AMD\n') or (
+        if text.startswith(AMD_DESKTOP_MARKER) or (
                 'StartupWMClass=gameviewer.exe\n' in text and
                 f'Path={ctx.app_dir}\n' in text):
             yield path
+
+
+def remove_amd_launchers(ctx):
+    # Also works when uninstall is invoked through the installed NVIDIA CLI.
+    # Only restore/remove our marked regular files; never follow a backup link.
+    paths = (ctx.home / '.local/share/applications/uuway-amd.desktop',
+             ctx.home / 'Desktop/UU远程.desktop',
+             ctx.home / '.local/share/applications/wine/Programs/UU远程.desktop')
+    for path in paths:
+        try:
+            if path.is_symlink() or not path.is_file() or not path.read_text().startswith(AMD_DESKTOP_MARKER):
+                continue
+            backup = path.with_suffix('.desktop.before-amd')
+            if backup.is_symlink() or (backup.exists() and not backup.is_file()):
+                warn(f'备份不是普通文件，保留入口：{path}')
+                continue
+            info(f'恢复快捷方式 {path}' if backup.is_file() else f'删除 {path}')
+            if not ctx.dry_run:
+                if backup.is_file():
+                    os.replace(backup, path)
+                else:
+                    path.unlink()
+        except OSError as error:
+            warn(f'{path}：{error}')
 
 
 def launchers_done(ctx):
@@ -817,7 +844,7 @@ def launchers_run(ctx):
     if amd_backend_enabled():
         for path in amd_launcher_targets(ctx):
             if not ctx.dry_run:
-                if path.is_file() and not path.read_text().startswith('# Managed by UUWay AMD\n'):
+                if path.is_file() and not path.read_text().startswith(AMD_DESKTOP_MARKER):
                     backup = path.with_suffix('.desktop.before-amd')
                     if not backup.exists():
                         shutil.copy2(path, backup)
@@ -1604,6 +1631,7 @@ def command_uninstall(args):
                 warn(f'不是 UUWay 管理的文件，已保留：{path}')
         except OSError as error:
             warn(f'{path}：{error}')
+    remove_amd_launchers(ctx)
     ctx.run(['systemctl', '--user', 'daemon-reload'], check=False)
     if args.purge:
         for directory in (ctx.config_dir, ctx.state_dir, ctx.releases.parent):

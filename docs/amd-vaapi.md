@@ -72,11 +72,16 @@ the GNOME screen-sharing prompt and remember the selected display. The normal
 UUWay user services and console are used. Setup checks actual hardware encoding
 instead of `nvidia-smi` when the AMD runtime marker is present.
 
-`open` also starts the Windows service bootstrap needed by UU 4.42 before
-login; with the bridge already running it only opens the existing UI. Setup's
+`open` starts the Windows service bootstrap needed by UU 4.42 for login
+when the bridge is stopped. With the bridge running, `open` reports how to
+re-enter setup instead of trying to activate an invisible window. Setup's
 launcher step repairs recognized vendor shortcuts and adds an AMD menu entry.
-The AMD service launches UU on the current desktop so its account/settings
-window remains visible; headless sessions retain the virtual-display fallback.
+The AMD background service keeps UU on an isolated Xvfb display, just like
+the NVIDIA backend. This preserves the clipboard bridge and deferred phone-file
+paste: Wine must retain its virtual-file clipboard while the desktop offers
+Linux file paths. The running service's account/settings window is therefore
+not shown on the desktop. To log in again, run `bash scripts/uuway-amd.sh setup --login`;
+setup stops the bridge before opening the login window and restarts it afterwards.
 The text supervisor validates the system Python executable by resolved path,
 including Ubuntu 26.04's Python 3.14.
 
@@ -84,6 +89,7 @@ The original `/usr/bin/uuway` still belongs to the upstream package. Use
 `uuway-amd` for this checkout; upstream `uuway update install` or `uuway refresh`
 would deploy the NVIDIA runtime. The AMD wrapper blocks its `update` command.
 Remove the user services with `uuway-amd uninstall` if no longer needed.
+Uninstall also removes the AMD menu entry and restores backed-up vendor shortcuts.
 
 ## Validation
 
@@ -107,5 +113,7 @@ UU 4.42.1's actual detector also initialized and encoded a first
 3840x2160 frame with both H.264 and HEVC, including its default spatial AQ,
 infinite GOP, one reference, single slice and absent color metadata requests.
 The Windows acceptance probe exercises the same AQ/GOP/slice settings and
-bitrate reconfiguration. The user confirmed that the desktop window is visible
-and interactive.
+bitrate reconfiguration. The author also tested a visible desktop window.
+Review subsequently restored
+Xvfb isolation for background operation to preserve clipboard file transfers;
+the visible login window remains available while the bridge is stopped.

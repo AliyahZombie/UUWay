@@ -85,15 +85,15 @@ int main(void) {
             self.assertEqual(launch.call_args.kwargs['env']['UURB_NATIVE_BOOTSTRAP'], '1')
             self.assertEqual((ctx.state_dir / 'login-support/winlogon.exe').read_bytes(), b'uu-native-winlogon.exe')
 
-    def test_open_with_running_bridge_does_not_bootstrap_second_server(self):
+    def test_open_with_running_bridge_explains_isolation_without_launching(self):
         with tempfile.TemporaryDirectory() as directory:
             ctx = Mock(dry_run=False, state_dir=Path(directory))
             ctx.wine_env.return_value = {}
             with patch.object(cli, 'amd_backend_enabled', return_value=True), \
                     patch.object(cli, 'unit_active', return_value=True), patch.object(cli.subprocess, 'Popen') as launch:
-                cli.open_uu(ctx)
-            self.assertEqual(len(launch.call_args.args[0]), 2)
-            self.assertNotIn('UURB_NATIVE_BOOTSTRAP', launch.call_args.kwargs['env'])
+                with self.assertRaisesRegex(cli.SetupError, 'setup --login'):
+                    cli.open_uu(ctx)
+            launch.assert_not_called()
 
     def test_setup_repairs_vendor_shortcut_and_is_idempotent(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -113,6 +113,65 @@ int main(void) {
                 self.assertTrue(cli.launchers_done(ctx))
                 self.assertIn('scripts/uuway-amd.sh" open', shortcut.read_text())
                 self.assertEqual(shortcut.with_suffix('.desktop.before-amd').read_text(), original)
+
+    def test_uninstall_restores_amd_shortcuts_even_without_backend_marker(self):
+        for dry_run in (False, True):
+            with self.subTest(dry_run=dry_run), tempfile.TemporaryDirectory() as directory:
+                home = Path(directory)
+                with patch.object(Path, 'home', return_value=home):
+                    args = Namespace(yes=True, purge=True, dry_run=dry_run)
+                    ctx = cli.Context(args)
+                paths = [home / 'Desktop/UU远程.desktop',
+                         home / '.local/share/applications/wine/Programs/UU远程.desktop',
+                         home / '.local/share/applications/uuway-amd.desktop']
+                originals = {}
+                for path in paths:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text(cli.amd_launcher_text())
+                    if path != paths[-1]:
+                        original = '[Desktop Entry]\nExec=wine original.exe\n'
+                        backup = path.with_suffix('.desktop.before-amd')
+                        backup.write_text(original)
+                        backup.chmod(0o750)
+                        originals[path] = original
+                ctx.prefix.mkdir(parents=True)
+                with patch.object(cli, 'Context', return_value=ctx), \
+                        patch.object(ctx, 'run'), patch.object(cli, 'amd_backend_enabled', return_value=False), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    cli.command_uninstall(args)
+                for path in paths:
+                    if dry_run:
+                        self.assertEqual(path.read_text(), cli.amd_launcher_text())
+                    elif path in originals:
+                        self.assertEqual(path.read_text(), originals[path])
+                        self.assertEqual(path.stat().st_mode & 0o777, 0o750)
+                        self.assertFalse(path.with_suffix('.desktop.before-amd').exists())
+                    else:
+                        self.assertFalse(path.exists())
+                self.assertTrue(ctx.prefix.is_dir())
+
+    def test_uninstall_preserves_unmanaged_entries_and_symlinks(self):
+        for kind in ('unmanaged', 'launcher_symlink', 'backup_symlink'):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory:
+                home = Path(directory)
+                with patch.object(Path, 'home', return_value=home):
+                    ctx = cli.Context(Namespace())
+                target = home / 'external.desktop'
+                target.write_text(cli.amd_launcher_text())
+                path = home / '.local/share/applications/uuway-amd.desktop'
+                path.parent.mkdir(parents=True)
+                if kind == 'launcher_symlink':
+                    path.symlink_to(target)
+                else:
+                    path.write_text('user entry' if kind == 'unmanaged' else cli.amd_launcher_text())
+                if kind == 'backup_symlink':
+                    path.with_suffix('.desktop.before-amd').symlink_to(target)
+                before = path.read_text()
+                with contextlib.redirect_stdout(io.StringIO()):
+                    cli.remove_amd_launchers(ctx)
+                self.assertEqual(path.read_text(), before)
+                self.assertEqual(target.read_text(), cli.amd_launcher_text())
+                self.assertEqual(path.is_symlink(), kind == 'launcher_symlink')
 
 
 if __name__ == '__main__':
